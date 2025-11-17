@@ -1041,3 +1041,172 @@ def ensure_device(tensor, device):
     else:
         # 如果不是张量（如numpy数组），转换为张量
         return torch.tensor(tensor, device=device)
+
+
+def _device_consistency_check():
+    """
+    设备一致性检查 - 修复服务器设备不匹配问题
+
+    专门针对服务器环境中cuda:0和cuda:2设备不匹配的解决方案
+    """
+    # 🔧 Phase 1: 强制环境变量设置（修复服务器设备不匹配）
+    print("🔧 [SERVER FIX] 强制CUDA设备一致性设置...")
+
+    # 🎯 **用户服务器使用GPU 2，强制设置GPU 2**
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = '2'  # **用户服务器使用GPU 2**
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+
+    # 检查CUDA环境
+    if torch.cuda.is_available():
+        print(f"   ✅ CUDA可用，版本: {torch.version.cuda}")
+        print(f"   ✅ PyTorch版本: {torch.__version__}")
+        print(f"   ✅ 检测到GPU数量: {torch.cuda.device_count()}")
+
+        # 🎯 **用户服务器强制使用GPU 2**
+        target_device_index = 0  # 设置CUDA_VISIBLE_DEVICES=2后，GPU 2变为索引0
+        target_device = 'cuda:0'  # 在可见设备中，GPU 2现在是cuda:0
+        try:
+            torch.cuda.set_device(target_device_index)  # 强制设置为GPU 2（现在是索引0）
+            current_device = torch.cuda.current_device()
+            print(f"   🔒 [FORCED] 当前CUDA设备: GPU {current_device} (原GPU 2)")
+
+            # 验证设备确实可用
+            if current_device == target_device_index:
+                print(f"   ✅ [SUCCESS] 成功强制使用GPU 2 (索引{current_device})")
+            else:
+                print(f"   ⚠️  [WARNING] 期望GPU 2(索引0)，实际GPU {current_device}")
+
+        except Exception as e:
+            print(f"   ❌ [ERROR] 强制设备设置失败: {e}")
+            print(f"   🔄 [FALLBACK] 使用CPU模式")
+            return torch.device('cpu')
+    else:
+        print("   ⚠️  CUDA不可用，使用CPU")
+        return torch.device('cpu')
+
+    # 🎯 [CRITICAL] 服务器设备一致性验证
+    print("🔍 [SERVER DIAG] 服务器设备一致性诊断:")
+
+    # 测试张量创建和设备检查
+    try:
+        test_tensor = torch.randn(10, 10, device='cuda:0')  # 这是原GPU 2
+        actual_device = test_tensor.device
+        print(f"   🧪 测试张量设备: {actual_device} (原GPU 2)")
+
+        # 检查所有可见GPU（现在只有GPU 2可见）
+        for i in range(torch.cuda.device_count()):
+            device_name = torch.cuda.get_device_name(i)
+            device_props = torch.cuda.get_device_properties(i)
+            print(f"   GPU {i} (原GPU 2): {device_name} (内存: {device_props.total_memory/1024**3:.1f}GB)")
+
+        # 确保所有后续操作都使用cuda:0（原GPU 2）
+        if str(actual_device) == 'cuda:0':
+            print(f"   ✅ [DEVICE OK] 使用目标设备: {actual_device} (原GPU 2)")
+            return torch.device('cuda:0')
+        else:
+            print(f"   ❌ [DEVICE MISMATCH] 期望cuda:0(原GPU 2)，实际{actual_device}")
+            print(f"   🔄 [FALLBACK] 强制返回cuda:0")
+            return torch.device('cuda:0')
+
+    except Exception as e:
+        print(f"   ❌ [CRITICAL ERROR] 设备测试失败: {e}")
+        print(f"   🔄 [FALLBACK] 使用CPU模式")
+        return torch.device('cpu')
+
+
+def diagnose_server_environment():
+    """
+    服务器环境全面诊断
+    专门用于诊断为什么本地正常但服务器失败的问题
+    """
+    print("=" * 80)
+    print("🏥 [SERVER DIAGNOSIS] 服务器环境全面诊断")
+    print("=" * 80)
+
+    # 1. Python和环境检查
+    print("\n🐍 Python环境:")
+    import sys
+    print(f"   Python版本: {sys.version}")
+    print(f"   可执行文件: {sys.executable}")
+
+    # 2. CUDA环境详细检查
+    print("\n🔥 CUDA环境:")
+    print(f"   PyTorch CUDA可用: {torch.cuda.is_available()}")
+    print(f"   PyTorch CUDA版本: {torch.version.cuda}")
+    print(f"   编译的CUDA版本: {torch.version.cuda or 'N/A'}")
+
+    if torch.cuda.is_available():
+        print(f"   GPU数量: {torch.cuda.device_count()}")
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            print(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
+            print(f"      计算能力: {props.major}.{props.minor}")
+            print(f"      总内存: {props.total_memory / 1024**3:.1f} GB")
+            print(f"      多处理器数量: {props.multi_processor_count}")
+
+    # 3. 环境变量检查
+    print("\n🌍 环境变量:")
+    import os
+    cuda_vars = ['CUDA_VISIBLE_DEVICES', 'PYTORCH_CUDA_ALLOC_CONF',
+                 'CUDA_DEVICE_ORDER', 'CUDA_LAUNCH_BLOCKING']
+    for var in cuda_vars:
+        value = os.environ.get(var, 'Not set')
+        print(f"   {var}: {value}")
+
+    # 4. 当前设备状态
+    print("\n📍 当前设备状态:")
+    if torch.cuda.is_available():
+        current = torch.cuda.current_device()
+        print(f"   当前设备: GPU {current}")
+        print(f"   当前设备名: {torch.cuda.get_device_name(current)}")
+
+        # 内存状态
+        allocated = torch.cuda.memory_allocated(current)
+        reserved = torch.cuda.memory_reserved(current)
+        print(f"   已分配内存: {allocated/1024**2:.1f} MB")
+        print(f"   已预留内存: {reserved/1024**2:.1f} MB")
+
+    # 5. Isaac Gym环境检查（如果可用）
+    print("\n🎮 Isaac Gym环境:")
+    try:
+        import gym
+        print(f"   Isaac Gym可用: True")
+        print(f"   路径: {gym.__file__ if hasattr(gym, '__file__') else 'Built-in'}")
+    except ImportError:
+        print(f"   Isaac Gym可用: False")
+
+    # 6. 推荐修复措施
+    print("\n💡 推荐修复措施:")
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print("   1. 多GPU环境检测到，强制使用GPU 2:")
+        print("      export CUDA_VISIBLE_DEVICES=2")
+        print("      export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128")
+        print("   2. 在代码中强制设备检查")
+        print("   3. 监控第500步附近的设备切换")
+    elif not torch.cuda.is_available():
+        print("   1. CUDA不可用，检查NVIDIA驱动:")
+        print("      nvidia-smi")
+        print("      检查PyTorch CUDA版本匹配")
+    else:
+        print("   1. 环境看起来正常，检查代码中的设备一致性")
+
+    print("=" * 80)
+
+
+def get_forced_device():
+    """
+    获取强制统一的设备，解决服务器设备不匹配问题
+
+    Returns:
+        torch.device: 强制统一的设备（优先cuda:0，否则cpu）
+    """
+    # 首先运行设备一致性检查
+    device = _device_consistency_check()
+
+    # 如果是服务器环境且出现问题，运行全面诊断
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print("🚨 [SERVER WARNING] 检测到多GPU环境，启用服务器修复模式")
+        diagnose_server_environment()
+
+    return device

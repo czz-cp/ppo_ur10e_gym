@@ -5,7 +5,7 @@
 env:
   num_envs: 2                    # 并行环境数量
   max_steps: 300                # 最大步数 (与MuJoCo原始配置一致)
-  device_id: 0                   # GPU设备ID
+  device_id: 2                   # GPU设备ID (用户服务器使用GPU 2)
   dt: 0.01                       # 100Hz，与MuJoCo原始配置一致
 
   # 目标位置范围 (UR10e工作空间)
@@ -15,9 +15,9 @@ env:
     z: [0.2, 1.2]                # Z轴范围
 
 # 🎯 设备配置（参考isaac_gym_manipulator方案）
-device: "cuda:0"                 # PyTorch设备
+device: "cuda:2"                 # PyTorch设备 (用户服务器使用GPU 2)
 sim:
-  device_id: 0                   # Isaac Gym仿真设备ID
+  device_id: 2                   # Isaac Gym仿真设备ID (用户服务器使用GPU 2)
   # 物理引擎配置（基于isaac_gym_manipulator成功配置）
   solver_type: 1                 # 使用solver_type=1
   num_position_iterations: 4     # 位置迭代次数
@@ -30,10 +30,10 @@ sim:
   substeps: 2                    # 使用2个子步骤，提高仿真稳定性
 
 graphics:
-  graphics_device_id: 0          # 图形设备ID
+  graphics_device_id: 2          # 图形设备ID (用户服务器使用GPU 2)
 
 visualization:
-  enable: true                   # 启用可视化（参考isaac_gym_manipulator）
+  enable: false                   # 启用可视化（参考isaac_gym_manipulator）
   render_freq: 1                 # 渲染频率
 
 # PPO算法配置

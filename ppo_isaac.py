@@ -18,7 +18,8 @@ import time
 import os
 
 from ur10e_env_isaac import UR10ePPOEnvIsaac
-from utils import ValueNormalization, GAE, assert_same_device, check_tensor_devices, get_tensor_device, ensure_device
+from utils import (ValueNormalization, GAE, assert_same_device, check_tensor_devices,
+                   get_tensor_device, ensure_device, get_forced_device)
 
 
 class ActorNetwork(nn.Module):
@@ -140,11 +141,23 @@ class PPOIsaac:
         self.env = env
         self.config = config
 
+        # 🎯 [SERVER FIX] 使用环境设备（参考isaac_gym_manipulator实现模式）
+        self.device = env.device
+        print(f"🔒 [ENV DEVICE] PPO使用环境设备: {self.device}")
+
+        # 🚨 [SERVER SAFETY] 验证设备一致性
+        forced_device = get_forced_device()
+        if str(self.device) != str(forced_device):
+            print(f"⚠️ [DEVICE MISMATCH] 环境设备{self.device} != 强制设备{forced_device}")
+            print(f"   强制使用环境设备: {self.device}")
+            # 在服务器环境中，强制环境设备为cuda:0
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
         # 环境参数
         self.num_envs = env.get_num_envs()
         self.state_dim = env.get_num_obs()
         self.action_dim = env.get_num_actions()
-        self.device = torch.device('cuda:0')
 
         # 网络初始化
         self.actor = ActorNetwork(self.state_dim, self.action_dim).to(self.device)
@@ -376,6 +389,12 @@ class PPOIsaac:
         Returns:
             metrics: 训练指标
         """
+        # 🎯 [SERVER FIX] 确保所有rollout数据在正确设备上
+        for key, tensor in rollouts.items():
+            if isinstance(tensor, torch.Tensor) and tensor.device != self.device:
+                print(f"⚠️ [DEVICE FIX] {key}从{tensor.device}移动到{self.device}")
+                rollouts[key] = tensor.to(self.device)
+
         # 准备数据
         states = rollouts['states'].view(-1, self.state_dim)  # [T*N, state_dim]
         actions = rollouts['actions'].view(-1, self.action_dim)  # [T*N, action_dim]
@@ -386,9 +405,23 @@ class PPOIsaac:
         rewards = rollouts['rewards'].view(self.rollout_length, self.num_envs)  # [T, N]
         dones = rollouts['dones'].view(self.rollout_length, self.num_envs)  # [T, N]
 
+        # 🔍 [CRITICAL CHECK] 验证设备一致性（预防第500步错误）
+        try:
+            assert_same_device(states, actions, old_log_probs, values, rewards, dones, device=self.device)
+            print(f"✅ [DEVICE OK] 所有rollout数据在{self.device}上")
+        except AssertionError as e:
+            print(f"❌ [DEVICE ERROR] {e}")
+            # 强制修复
+            states = states.to(self.device)
+            actions = actions.to(self.device)
+            old_log_probs = old_log_probs.to(self.device)
+            values = values.to(self.device)
+            rewards = rewards.to(self.device)
+            dones = dones.to(self.device)
+
         # 获取下一个状态的价值
         with torch.no_grad():
-            last_next_state = rollouts['next_states'][-1]
+            last_next_state = rollouts['next_states'][-1].to(self.device)
             next_values = self.critic(last_next_state).squeeze(-1)  # [N]
             # 修复：为GAE函数创建正确形状的next_values [T, N]
             next_values_expanded = next_values.unsqueeze(0).expand(self.rollout_length, -1)  # [T, N]

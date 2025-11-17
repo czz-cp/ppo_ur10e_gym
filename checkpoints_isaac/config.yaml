@@ -109,5 +109,5 @@ value_normalization:
   enabled: true
   epsilon: 1e-5
 visualization:
-  enable: true
+  enable: false
   render_freq: 1

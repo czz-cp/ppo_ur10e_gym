@@ -228,6 +228,7 @@ def main():
     try:
         from ppo_isaac import PPOIsaac, load_config_isaac
         from ur10e_env_isaac import UR10ePPOEnvIsaac
+        from utils import get_forced_device
     except Exception as e:
         print(f"❌ 训练器导入失败: {e}")
         import traceback
@@ -269,12 +270,17 @@ def main():
         print(f"   回合: {config['train']['num_episodes']}")
         print(f"   渲染: {'启用' if args.render else '禁用'}")
 
-        # 创建环境
+        # 🎯 [SERVER FIX] 获取强制设备并创建环境
+        forced_device = get_forced_device()
+        # **用户服务器使用GPU 2，但设置CUDA_VISIBLE_DEVICES=2后，GPU 2变为cuda:0**
+        device_id = 2  # 直接使用GPU 2
+
         print(f"🏗️ 创建Isaac Gym环境...")
+        print(f"   🔒 [FORCED] 使用设备: {forced_device} (原GPU 2, device_id: {device_id})")
         env = UR10ePPOEnvIsaac(
             config_path=args.config,
             num_envs=config['env']['num_envs'],
-            device_id=config['env']['device_id']
+            device_id=device_id
         )
 
         print("✅ 环境创建成功")
