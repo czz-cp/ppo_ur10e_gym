@@ -85,23 +85,32 @@ class UR10ePPOEnvIsaac:
         # 加载配置
         self.config = self._load_config(config_path)
         self.num_envs = num_envs
-        self.device_id = device_id
 
-        # 🎯 GPU设备配置（参考 isaac_gym_manipulator 模式）
+        # 🎯 优先使用传入的device_id，覆盖配置文件中的设置（多GPU服务器兼容）
+        self.device_id = device_id
+        if 'device_id' in self.config.get('env', {}):
+            config_device_id = self.config['env']['device_id']
+            if device_id != config_device_id:
+                print(f"⚠️ 覆盖配置文件中的设备ID: {config_device_id} -> {device_id}")
+
+        # 🎯 GPU设备配置（多GPU服务器兼容模式）
         if torch.cuda.is_available() and device_id >= 0:
             # 检查GPU设备是否可用
             if device_id < torch.cuda.device_count():
                 self.device = torch.device(f'cuda:{device_id}')
                 # 设置当前CUDA设备（确保所有操作都在指定的GPU上）
                 torch.cuda.set_device(device_id)
+                print(f"🔧 设置PyTorch使用GPU {device_id}: {torch.cuda.get_device_name(device_id)}")
             else:
                 print(f"[Warning] GPU {device_id} not available, only {torch.cuda.device_count()} GPUs found. Using GPU 0.")
                 self.device = torch.device('cuda:0')
                 torch.cuda.set_device(0)
                 device_id = 0  # 更新为实际使用的设备ID
+                print(f"🔧 回退到GPU 0: {torch.cuda.get_device_name(0)}")
         else:
             self.device = torch.device('cpu')
             device_id = -1  # CPU模式
+            print("🖥️ 使用CPU模式")
 
         # UR10e机器人参数
         self.num_dofs = 6  # UR10e有6个自由度
@@ -193,8 +202,26 @@ class UR10ePPOEnvIsaac:
             print(f"   Kd: {pid_params['d']}")
             print(f"   Ki: {pid_params['i']}")
 
+        # 🔍 设备兼容性���查（多GPU服务器）
+        self._device_consistency_check()
+
+    def _device_consistency_check(self):
+        """设备一致性检查和修复（多GPU服务器兼容）"""
+        if torch.cuda.is_available():
+            print(f"🔍 设备兼容性检查:")
+            print(f"   PyTorch当前设备: {torch.cuda.current_device()}")
+            print(f"   PyTorch设备数量: {torch.cuda.device_count()}")
+            for i in range(torch.cuda.device_count()):
+                print(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
+
+            # 强制所有后续CUDA操作都在指定GPU上
+            if self.device.type == 'cuda':
+                torch.cuda.set_device(self.device)
+                print(f"   ✅ 强制所有CUDA操作使用GPU {self.device.index}")
+        else:
+            print("   ℹ️ CUDA不可用，使用CPU模式")
+
     def _load_config(self, config_path: str) -> Dict[str, Any]:
-        """加载配置文件"""
         import yaml
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -257,9 +284,10 @@ class UR10ePPOEnvIsaac:
             graphics_device_id = -1  # 无头模式
             print("🖥️ 无头模式，禁用渲染")
 
-        # 创建仿真器（使用PhysX而非FleX，参考isaac_gym_manipulator）
+        # 🎯 强制Isaac Gym使用指定GPU设备（多GPU服务器兼容）
+        print(f"🎮 创建Isaac Gym仿真器 - 计算设备: GPU {self.device_id}, 图形设备: {graphics_device_id}")
         self.sim = self.gym.create_sim(
-            compute_device=self.device_id,
+            compute_device=self.device_id,  # 强制使用指定的GPU
             graphics_device=graphics_device_id,
             type=gymapi.SIM_PHYSX,  # 关键：使用PhysX而不是默认的FleX
             params=sim_params
@@ -494,12 +522,18 @@ class UR10ePPOEnvIsaac:
             device=self.device, dtype=torch.bool
         )
 
-        # 获取状态和动作的张量视图
+        # 🎯 获取Isaac Gym张量视图并强制设备一致性
         self.root_states = self.gym.acquire_actor_root_state_tensor(self.sim)
         self.dof_states = self.gym.acquire_dof_state_tensor(self.sim)
 
         self.root_states = gymtorch.wrap_tensor(self.root_states)
         self.dof_states = gymtorch.wrap_tensor(self.dof_states)
+
+        # 🚨 强制Isaac Gym张量移动到指定设备（修复多GPU设备不匹配问题）
+        if self.device.type == 'cuda':
+            self.root_states = self.root_states.to(self.device)
+            self.dof_states = self.dof_states.to(self.device)
+            print(f"🔧 Isaac Gym张量已移动到GPU {self.device.index}: {self.device}")
 
     def _setup_renderer(self):
         """设置Isaac Gym渲染器 - 参考isaac_gym_manipulator实现"""
@@ -593,8 +627,12 @@ class UR10ePPOEnvIsaac:
             self.dof_states[start_idx:end_idx, 0] = joint_angles.to(self.device)  # 位置 - 确保在正确设备上
             self.dof_states[start_idx:end_idx, 1] = 0.0  # 速度
 
-        # 应用到仿真（isaac_gym_manipulator 模式）
-        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_states))
+        # 🎯 修复DOF状态张量设备问题（确保CPU张量再unwrap）
+        if self.dof_states.device.type != 'cpu':
+            dof_states_cpu = self.dof_states.cpu()
+        else:
+            dof_states_cpu = self.dof_states
+        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(dof_states_cpu))
 
         # 运行几步simulation让机械臂稳定（参考isaac_gym_manipulator）
         for _ in range(10):
@@ -863,12 +901,18 @@ class UR10ePPOEnvIsaac:
                         saturation = abs(force) / limit * 100
                         print(f"      {j+1}. {name:12}: {force:7.2f} N⋅m (限制: ±{limit:5.1f}, 饱和度: {saturation:5.1f}%)")
 
-        # 使用Isaac Gym官方示例的正确API：一次性设置所有环境的力矩
+        # 🎯 Isaac Gym官方API：确保力矩张量在CPU上再unwrap（修复设备不匹配）
         # 参考: gym.set_dof_actuation_force_tensor(sim, gymtorch.unwrap_tensor(u))
         try:
-            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(all_dof_forces))
+            # 确保力矩张量在CPU上（gymtorch.unwrap_tensor需要CPU张量）
+            if all_dof_forces.device.type != 'cpu':
+                all_dof_forces_cpu = all_dof_forces.cpu()
+            else:
+                all_dof_forces_cpu = all_dof_forces
+
+            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(all_dof_forces_cpu))
             if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
-                print(f"✅ Isaac Gym力矩设置成功: 形状={all_dof_forces.shape}, 设备={all_dof_forces.device}")
+                print(f"✅ Isaac Gym力矩设置成功: 形状={all_dof_forces.shape}, 原始设备={all_dof_forces.device}, 传输到CPU")
         except Exception as e:
             print(f"❌ Isaac Gym力矩设置失败: {e}")
             print(f"   力矩张量形状: {all_dof_forces.shape}")
