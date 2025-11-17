@@ -1,0 +1,137 @@
+# Isaac Gym PPO配置文件
+# UR10e RL-PID混合控制 - Isaac Gym版本（清理重复参数）
+
+# 环境配置
+env:
+  num_envs: 2                    # 并行环境数量
+  max_steps: 300                # 最大步数 (与MuJoCo原始配置一致)
+  device_id: 0                   # GPU设备ID
+  dt: 0.01                       # 100Hz，与MuJoCo原始配置一致
+
+  # 目标位置范围 (UR10e工作空间)
+  target_range:
+    x: [-0.8, 0.8]               # X轴范围
+    y: [-0.8, 0.8]               # Y轴范围
+    z: [0.2, 1.2]                # Z轴范围
+
+# Isaac Gym仿真器配置
+simulator:
+  # 物理引擎配置（基于isaac_gym_manipulator成功配置）
+  solver_type: 1                 # 使用solver_type=1
+  num_position_iterations: 4     # 位置迭代次数
+  num_velocity_iterations: 1     # 速度迭代次数
+  num_threads: 0                 # 线程数（0=自动）
+  use_gpu: true                  # 启用GPU
+  use_gpu_pipeline: false        # 禁用GPU渲染管线
+
+  # 时间步长配置
+  substeps: 2                    # 使用2个子步骤，提高仿真稳定性
+
+  # GPU设备设置
+  graphics_device: 0             # 图形设备ID
+  enable_rendering: true         # 启用渲染
+
+# PPO算法配置
+ppo:
+  # 学习率
+  lr_actor: 3e-4                 # Actor学习率
+  lr_critic: 1e-3                # Critic学习率
+
+  # PPO核心参数
+  clip_eps: 0.2                  # 裁剪参数
+  gamma: 0.99                    # 折扣因子
+  lam: 0.95                      # GAE λ参数
+
+  # 正则化
+  entropy_coef: 0.01             # 熵系数
+  value_coef: 0.5                # 价值函数系数
+
+  # 梯度处理
+  max_grad_norm: 0.5             # 梯度裁剪阈值
+
+# 训练配置
+train:
+  rollout_length: 512           # 回合长度
+  batch_size: 32                 # 批次大小
+  num_updates: 10                # 每次收集后更新次数
+  num_episodes: 10000            # 总训练回合数
+
+  # 保存和日志
+  save_interval: 100             # 保存间隔
+  log_interval: 10               # 日志间隔
+
+# 奖励函数配置（基于原始MuJoCo论文设计）
+reward:
+  # 🎯 精度奖励 r_a^t = -w_a * exp(σ * f_a(θ^t))
+  accuracy:
+    weight: 5.0                  # 精度权重
+    threshold: 0.005             # 成功阈值（米）
+    sigma: 0.5                   # 指数惩罚参数（控制惩罚陡峭程度）
+
+  # 🔧 控制稳定性奖励（PID参数变化幅度控制）
+  stability:
+    weight: 0.5                  # 稳定性权重
+    max_change: 0.5              # 最大参数变化幅度
+
+  # 🏃 响应速度奖励（奖励误差减少速度）
+  speed:
+    weight: 1.0                  # 速度权重
+
+  # 🎊 稀疏成功奖励（到达目标时的额外奖励）
+  extra:
+    success_reward: 10.0         # 成功到达目标位置的奖励
+
+  # 📝 已移除：能耗效率奖励（专注于位置控制性能）
+  # energy:
+  #   weight: 0.001                # 能耗权重
+
+# UR10e官方PID参数配置（基于isaac_gym_manipulator官方配置）
+# 参考: /isaac_gym_manipulator/ros_sources/universal_robot/ur_gazebo/config/ur10e_controllers.yaml
+pid_params:
+  # 基础PID参数（官方推荐值）
+  base_gains:
+    # 比例增益 P: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
+    p: [20000.0, 20000.0, 10000.0, 500.0, 500.0, 10.0]
+    # 微分增益 D: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
+    d: [100.0, 100.0, 100.0, 1.0, 1.0, 0.1]
+    # 积分增益 I: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
+    i: [10.0, 20.0, 10.0, 1.0, 1.0, 0.0]
+
+  # 力矩限制（来自官��URDF）
+  torque_limits: [330.0, 330.0, 150.0, 54.0, 54.0, 54.0]  # N⋅m
+
+# 网络架构配置
+network:
+  # Actor网络
+  actor:
+    hidden_dim: 64               # 隐藏层维度
+    num_layers: 3                # 网络层数
+    activation: "relu"           # 激活函数
+
+  # Critic网络
+  critic:
+    hidden_dim: 64               # 隐藏层维度
+    num_layers: 3                # 网络层数
+    activation: "relu"           # 激活函数
+
+# 价值归一化配置
+value_normalization:
+  enabled: true                  # 启用价值归一化
+  beta: 0.995                    # EMA系数
+  epsilon: 1e-5                  # 数值稳定性参数
+  clip_range: 10.0               # 归一化裁剪范围
+
+# 奖励归一化配置
+reward_normalization:
+  enabled: true                  # 启用奖励归一化
+  gamma: 0.99                    # 折扣因子
+  clip_range: 5.0                # 归一化值裁剪范围
+  warmup_steps: 100              # 热身步数
+  normalize_method: 'running_stats'  # 归一化方法
+  per_env: true                  # 每个环境独立归一化
+
+# 调试和监控
+debug:
+  log_level: "INFO"              # 日志级别
+  monitor_frequency: 10          # 监控频率
+  save_visualization: false      # 保存可视化数据
