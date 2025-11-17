@@ -14,8 +14,10 @@ env:
     y: [-0.8, 0.8]               # Y轴范围
     z: [0.2, 1.2]                # Z轴范围
 
-# Isaac Gym仿真器配置
-simulator:
+# 🎯 设备配置（参考isaac_gym_manipulator方案）
+device: "cuda:0"                 # PyTorch设备
+sim:
+  device_id: 0                   # Isaac Gym仿真设备ID
   # 物理引擎配置（基于isaac_gym_manipulator成功配置）
   solver_type: 1                 # 使用solver_type=1
   num_position_iterations: 4     # 位置迭代次数
@@ -27,9 +29,12 @@ simulator:
   # 时间步长配置
   substeps: 2                    # 使用2个子步骤，提高仿真稳定性
 
-  # GPU设备设置
-  graphics_device: 0             # 图形设备ID
-  enable_rendering: true         # 启用渲染
+graphics:
+  graphics_device_id: 0          # 图形设备ID
+
+visualization:
+  enable: true                   # 启用可视化（参考isaac_gym_manipulator）
+  render_freq: 1                 # 渲染频率
 
 # PPO算法配置
 ppo:

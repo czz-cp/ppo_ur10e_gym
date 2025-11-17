@@ -2,6 +2,7 @@ debug:
   log_level: INFO
   monitor_frequency: 10
   save_visualization: false
+device: cuda:0
 env:
   device_id: 0
   dt: 0.01
@@ -17,6 +18,8 @@ env:
     z:
     - 0.2
     - 1.2
+graphics:
+  graphics_device_id: 0
 network:
   actor:
     activation: relu
@@ -84,9 +87,8 @@ reward_normalization:
   normalize_method: running_stats
   per_env: true
   warmup_steps: 100
-simulator:
-  enable_rendering: true
-  graphics_device: 0
+sim:
+  device_id: 0
   num_position_iterations: 4
   num_threads: 0
   num_velocity_iterations: 1
@@ -106,3 +108,6 @@ value_normalization:
   clip_range: 10.0
   enabled: true
   epsilon: 1e-5
+visualization:
+  enable: true
+  render_freq: 1

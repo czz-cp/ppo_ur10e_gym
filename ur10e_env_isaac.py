@@ -93,24 +93,36 @@ class UR10ePPOEnvIsaac:
             if device_id != config_device_id:
                 print(f"⚠️ 覆盖配置文件中的设备ID: {config_device_id} -> {device_id}")
 
-        # 🎯 GPU设备配置（多GPU服务器兼容模式）
-        if torch.cuda.is_available() and device_id >= 0:
-            # 检查GPU设备是否可用
-            if device_id < torch.cuda.device_count():
-                self.device = torch.device(f'cuda:{device_id}')
-                # 设置当前CUDA设备（确保所有操作都在指定的GPU上）
-                torch.cuda.set_device(device_id)
-                print(f"🔧 设置PyTorch使用GPU {device_id}: {torch.cuda.get_device_name(device_id)}")
-            else:
-                print(f"[Warning] GPU {device_id} not available, only {torch.cuda.device_count()} GPUs found. Using GPU 0.")
-                self.device = torch.device('cuda:0')
-                torch.cuda.set_device(0)
-                device_id = 0  # 更新为实际使用的设备ID
-                print(f"🔧 回退到GPU 0: {torch.cuda.get_device_name(0)}")
+        # 🎯 设备配置（参考isaac_gym_manipulator成功方案）
+        device_str = self.config.get('device', 'cuda:0')
+        self.device = torch.device(device_str)
+
+        # 图形设备配置（修复config参数传递）
+        viz_config = self.config.get('visualization', {})
+        if viz_config.get('enable', False):
+            graphics_device_id = self.config.get('graphics', {}).get('graphics_device_id', 0)
         else:
-            self.device = torch.device('cpu')
-            device_id = -1  # CPU模式
-            print("🖥️ 使用CPU模式")
+            graphics_device_id = -1
+
+        # 仿真设备ID（从config读取，保持与PyTorch设备一致）
+        self.sim_device_id = self.config.get('sim', {}).get('device_id', 0)
+
+        print(f"🎯 设备配置 (isaac_gym_manipulator方案):")
+        print(f"   PyTorch设备: {self.device}")
+        print(f"   仿真设备ID: {self.sim_device_id}")
+        print(f"   图形设备ID: {graphics_device_id}")
+
+        # 🔍 调试：打印config关键参数
+        print(f"🔍 Config调试信息:")
+        print(f"   config['device']: {self.config.get('device', 'NOT_FOUND')}")
+        print(f"   config['sim']: {self.config.get('sim', 'NOT_FOUND')}")
+        print(f"   config['graphics']: {self.config.get('graphics', 'NOT_FOUND')}")
+        print(f"   config['visualization']: {self.config.get('visualization', 'NOT_FOUND')}")
+
+        # 强制CUDA设备一致性
+        if self.device.type == 'cuda':
+            torch.cuda.set_device(self.device)
+            print(f"   ✅ 强制设置CUDA设备: {self.device}")
 
         # UR10e机器人参数
         self.num_dofs = 6  # UR10e有6个自由度
@@ -273,21 +285,24 @@ class UR10ePPOEnvIsaac:
         sim_params.physx.use_gpu = simulator_config.get('use_gpu', True)
         # 修复：正确设置GPU渲染管线，避免CUDA内存问题
         sim_params.use_gpu_pipeline = simulator_config.get('use_gpu_pipeline', False)
-        enable_rendering = simulator_config.get('enable_rendering', False)
-        graphics_device = simulator_config.get('graphics_device', self.device_id)
+        # 🎯 修复渲染配置读取（使用新的config结构）
+        viz_config = self.config.get('visualization', {})
+        graphics_config = self.config.get('graphics', {})
+
+        enable_rendering = viz_config.get('enable', False)
+        graphics_device_id = graphics_config.get('graphics_device_id', self.device_id) if enable_rendering else -1
 
         # 根据渲染设置选择图形设备
         if enable_rendering:
-            graphics_device_id = graphics_device
             print(f"🎬 启用渲染模式，图形设备: {graphics_device_id}")
         else:
             graphics_device_id = -1  # 无头模式
             print("🖥️ 无头模式，禁用渲染")
 
-        # 🎯 强制Isaac Gym使用指定GPU设备（多GPU服务器兼容）
-        print(f"🎮 创建Isaac Gym仿真器 - 计算设备: GPU {self.device_id}, 图形设备: {graphics_device_id}")
+        # 🎯 Isaac Gym仿真器创建（isaac_gym_manipulator方案）
+        print(f"🎮 创建Isaac Gym仿真器 - 计算设备: {self.sim_device_id}, 图形设备: {graphics_device_id}")
         self.sim = self.gym.create_sim(
-            compute_device=self.device_id,  # 强制使用指定的GPU
+            compute_device=self.sim_device_id,  # 使用配置中的仿真设备ID
             graphics_device=graphics_device_id,
             type=gymapi.SIM_PHYSX,  # 关键：使用PhysX而不是默认的FleX
             params=sim_params
@@ -306,9 +321,12 @@ class UR10ePPOEnvIsaac:
         self.gym.add_ground(self.sim, plane_params)
         print("✅ 已添加地面")
 
-        # 渲染配置
-        self.enable_rendering = self.config.get('simulator', {}).get('enable_rendering', False)
-        self.graphics_device = self.config.get('simulator', {}).get('graphics_device', self.device_id)
+        # 🎯 渲染配置（使用新的config结构）
+        viz_config = self.config.get('visualization', {})
+        graphics_config = self.config.get('graphics', {})
+
+        self.enable_rendering = viz_config.get('enable', False)
+        self.graphics_device = graphics_config.get('graphics_device_id', self.device_id)
 
         if self.enable_rendering:
             print(f"🎬 启用Isaac Gym渲染，图形设备: {self.graphics_device}")
