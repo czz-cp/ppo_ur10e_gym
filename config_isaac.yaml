@@ -4,20 +4,21 @@
 # 环境配置
 env:
   num_envs: 2                    # 并行环境数量
-  max_steps: 300                # 最大步数 (与MuJoCo原始配置一致)
+  max_steps: 500                 # 增加最大步数，给足够时间到达目标
   device_id: 2                   # GPU设备ID (用户服务器使用GPU 2)
   dt: 0.01                       # 100Hz，与MuJoCo原始配置一致
 
-  # 目标位置范围 (UR10e工作空间)
+  # 🎯 目标位置范围 (UR10e舒适工作区)
+  # 缩小范围确保目标可达，避免过于困难的远距离目标
   target_range:
-    x: [-0.8, 0.8]               # X轴范围
-    y: [-0.8, 0.8]               # Y轴范围
-    z: [0.2, 1.2]                # Z轴范围
+    x: [-0.6, 0.6]               # X轴范围 (缩小到舒适工作区)
+    y: [-0.6, 0.6]               # Y轴范围 (缩小到舒适工作区)
+    z: [0.1, 0.8]                # Z轴范围 (避免过高或过低的目标)
 
 # 🎯 设备配置（参考isaac_gym_manipulator方案）
 device: "cuda:2"                 # PyTorch设备 (用户服务器使用GPU 2)
 sim:
-  device_id: 2                   # Isaac Gym仿真设备ID (用户服务器使用GPU 2)
+  device_id: 2                  # Isaac Gym仿真设备ID (用户服务器使用GPU 2)
   # 物理引擎配置（基于isaac_gym_manipulator成功配置）
   solver_type: 1                 # 使用solver_type=1
   num_position_iterations: 4     # 位置迭代次数
@@ -36,27 +37,27 @@ visualization:
   enable: false                   # 启用可视化（参考isaac_gym_manipulator）
   render_freq: 1                 # 渲染频率
 
-# PPO算法配置
+# PPO算法配置（优化超参数）
 ppo:
-  # 学习率
-  lr_actor: 3e-4                 # Actor学习率
-  lr_critic: 1e-3                # Critic学习率
+  # 学习率（降低以稳定训练）
+  lr_actor: 1e-4                 # 降低Actor学习率，更稳定学习
+  lr_critic: 5e-4                # 降低Critic学习率
 
-  # PPO核心参数
-  clip_eps: 0.2                  # 裁剪参数
-  gamma: 0.99                    # 折扣因子
-  lam: 0.95                      # GAE λ参数
+  # PPO核心参数（保守设置）
+  clip_eps: 0.15                 # 降低裁剪参数，更保守更新
+  gamma: 0.995                   # 略微提高折扣因子，更重视长期奖励
+  lam: 0.95                      # GAE λ参数保持不变
 
-  # 正则化
-  entropy_coef: 0.01             # 熵系数
-  value_coef: 0.5                # 价值函数系数
+  # 正则化（增加探索）
+  entropy_coef: 0.02             # 增加熵系数，鼓励更多探索
+  value_coef: 0.5                # 价值函数系数保持不变
 
   # 梯度处理
-  max_grad_norm: 0.5             # 梯度裁剪阈值
+  max_grad_norm: 0.5             # 梯度裁剪阈值保持不变
 
-# 训练配置
+# 训���配置（优化rollout策略）
 train:
-  rollout_length: 512           # 回合长度
+  rollout_length: 256           # 降低rollout长度，更适合500步episode
   batch_size: 32                 # 批次大小
   num_updates: 10                # 每次收集后更新次数
   num_episodes: 10000            # 总训练回合数
@@ -65,26 +66,24 @@ train:
   save_interval: 100             # 保存间隔
   log_interval: 10               # 日志间隔
 
-# 奖励函数配置（基于原始MuJoCo论文设计）
+# 🎯 重新设计的奖励函数配置（学习友好型）
 reward:
-  # 🎯 精度奖励 r_a^t = -w_a * exp(σ * f_a(θ^t))
+  # 🎯 距离奖励（温和的线性惩罚）
   accuracy:
-    weight: 5.0                  # 精度权重
-    threshold: 0.005             # 成功阈值（米）
-    sigma: 0.5                   # 指数惩罚参数（控制惩罚陡峭程度）
+    weight: 2.0                  # 降低精度权重，避免过度惩罚
+    threshold: 0.005             # 放宽成功阈值到5厘米（更现实）
 
-  # 🔧 控制稳定性奖励（PID参数变化幅度控制）
+  # 🏃 进度奖励（奖励向目标移动的行为）
+  progress:
+    weight: 3.0                  # 增加进度奖励权重，鼓励主动接近
+
+  # 🔧 稳定性奖励（PID参数合理性约束）
   stability:
-    weight: 0.5                  # 稳定性权重
-    max_change: 0.5              # 最大参数变化幅度
+    weight: 0.3                  # 降低稳定性权重，允许更多探索
 
-  # 🏃 响应速度奖励（奖励误差减少速度）
-  speed:
-    weight: 1.0                  # 速度权重
-
-  # 🎊 稀疏成功奖励（到达目标时的额外奖励）
+  # 🎊 成功奖励（明确的目标到达信号）
   extra:
-    success_reward: 10.0         # 成功到达目标位置的奖励
+    success_reward: 5.0          # 降低成功奖励，避免过度依赖稀疏奖励
 
   # 📝 已移除：能耗效率奖励（专注于位置控制性能）
   # energy:

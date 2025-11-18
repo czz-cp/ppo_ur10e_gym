@@ -41,12 +41,20 @@ class ActorNetwork(nn.Module):
         )
 
         # 初始化权重
-        self.apply(self._init_weights)
+        self._init_actor_weights()
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight.data, gain=np.sqrt(2))
-            nn.init.constant_(module.bias.data, 0)
+    def _init_actor_weights(self):
+        """专门为Actor网络设计的初始化，确保输出动作在合理范围内"""
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                if 'policy_net.5' in name:  # 输出层
+                    # 输出层：均值为1.05（动作范围中点），权重较小
+                    nn.init.constant_(module.weight.data, 0.01)
+                    nn.init.constant_(module.bias.data, 1.05)  # (0.1 + 2.0) / 2
+                else:
+                    # 隐藏层：标准初始化
+                    nn.init.orthogonal_(module.weight.data, gain=np.sqrt(2))
+                    nn.init.constant_(module.bias.data, 0)
 
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -80,8 +88,11 @@ class ActorNetwork(nn.Module):
         action = dist.sample()
         log_prob = dist.log_prob(action).sum(dim=-1)
 
-        # 裁剪动作到合理范围
-        action = torch.clamp(action, -0.5, 1.0)
+        # ���� 修复：裁剪动作到PID参数合理范围 (确保kp为正)
+        # kp_scale: [0.1, 2.0] - 比例增益缩放，必须为正
+        # kd_scale: [0.0, 1.0] - 微分增益缩放
+        # ki_scale: [0.0, 0.5] - 积分增益缩放
+        action = torch.clamp(action, 0.1, 2.0)
 
         return action, log_prob
 

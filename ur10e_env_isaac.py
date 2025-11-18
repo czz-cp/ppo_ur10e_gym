@@ -967,22 +967,35 @@ class UR10ePPOEnvIsaac:
         # 🎯 ��化：每个关节使用各自的kp进行控制（参考原始MuJoCo实现）
         joint_control = torch.zeros(6, device=self.device)
 
-        # 先转换任务空间误差到关节空间
-        joint_position_errors = jacobian.T @ position_error
+        # 🎯 改进：雅可比矩阵稳定性检查
+        jacobian_det = torch.det(jacobian @ jacobian.T)
+        if torch.abs(jacobian_det) < 1e-6:
+            # 雅可比矩阵接近奇异，使用简化控制
+            joint_position_errors = position_error.repeat(6) * 0.1
+        else:
+            # 正常情况：转换任务空间误差到关节空间
+            joint_position_errors = jacobian.T @ position_error
 
-        # 每个关节使用各自的kp、kd进行控制（ki参数预留，未来可添加积分项）
+        # 每个关节使用各自的kp、kd进行控制（增加稳定性）
+        joint_control = torch.zeros(6, device=self.device)
+        ur10e_torque_limits = [330.0, 330.0, 150.0, 54.0, 54.0, 54.0]  # N⋅m
+
         for i in range(6):
-            # 比例���：每个关节使用各自的kp
+            # 比例项：每个关节使用各自的kp
             p_term = kp[i] * joint_position_errors[i]
 
             # 阻尼项：每个关节使用各自的kd
             d_term = kd[i] * current_velocities[i]
 
-            # 🎯 官方PID参数已配置，积分项预留（需要误差累积状态）
-            # i_term = ki[i] * self.integral_errors[i]  # 未来可添加
+            # 🎯 改进：添加饱和和限制，避免力矩过大
+            control_torque = p_term - d_term
 
-            # 关节控制力矩 = 比例项 - 阻尼项 (+ 积分项)
-            joint_control[i] = p_term - d_term
+            # 力矩限制
+            max_torque = ur10e_torque_limits[i] * 0.8  # 使用80%的安全限制
+            control_torque = torch.clamp(control_torque, -max_torque, max_torque)
+
+            # 关节控制力矩
+            joint_control[i] = control_torque
 
         return joint_control
 
@@ -1022,9 +1035,13 @@ class UR10ePPOEnvIsaac:
 
     def _compute_rewards_batch(self, actions: torch.Tensor) -> torch.Tensor:
         """
-        🎯 基于原始MuJoCo实现的批量奖励计算（去除能耗奖励）
+        🎯 重新设计的学习友好型奖励函数
 
-        设计思路参考论文：r(s_t, a_t) = r_a^t + r_s^t + r_ex^t
+        新的设计原则：
+        1. 温和的距离惩罚，避免巨大的负奖励
+        2. 明确的进度奖励，鼓励向目标移动
+        3. 合理的成功奖励，提供明确的目标信号
+        4. 适中的稳定性控制，避免过度约束
 
         Args:
             actions: PID调度动作 [num_envs, 3]
@@ -1039,40 +1056,49 @@ class UR10ePPOEnvIsaac:
         # 计算位置误差
         position_errors = torch.norm(self.target_positions - current_positions, dim=1)
 
-        # 1. 🎯 精度奖励 r_a^t = -w_a * exp(σ_a * f_a(θ^t))
-        # 基于原始MuJoCo实现的指数惩罚设计
-        f_a_theta = position_errors ** 2  # f_a(θ^t) = ||p_d - p||^2
+        # 🎯 1. 温和的距离奖励（使用线性惩罚而非指数惩罚）
+        # r_distance = -w_d * distance，确保奖励在合理范围内
+        max_distance = 1.0  # 最大期望距离
+        normalized_distance = torch.clamp(position_errors / max_distance, 0.0, 1.0)
+        distance_reward = -self.config['reward']['accuracy']['weight'] * normalized_distance
 
-        # 使用指数惩罚：误差小时惩罚温和，误差大时惩罚急剧增加
-        # 使用config中的sigma参数，便于调整惩罚的陡峭程度
-        sigma = self.config['reward']['accuracy']['sigma']
-        accuracy_reward = -self.config['reward']['accuracy']['weight'] * torch.exp(sigma * f_a_theta)
-
-        # 2. 🏃 速度奖励 r_s^t（奖励误差减少速度）
+        # 🏃 2. 进度奖励（奖励误差减少）
+        progress_reward = torch.zeros_like(position_errors)
         if self.prev_position_errors is not None:
-            error_change = self.prev_position_errors - position_errors
-            speed_reward = self.config['reward']['speed']['weight'] * torch.clamp(error_change, min=0.0)
-        else:
-            speed_reward = torch.zeros_like(position_errors)
+            error_reduction = self.prev_position_errors - position_errors
+            # 只奖励误差减少，忽略误差增加
+            progress_reward = self.config['reward']['progress']['weight'] * torch.clamp(error_reduction, 0.0, max_distance)
 
-        # 3. 🔧 稳定性奖励（PID参数变化幅度控制）
-        stability_reward = -self.config['reward']['stability']['weight'] * (
-            torch.abs(actions[:, 0]) + torch.abs(actions[:, 1])  # kp_scale + kd_scale
-        )
+        # 🔧 3. 稳定性奖励（温和的PID参数约束）
+        # 鼓励使用适中的PID参数，避免极端值
+        # kp_scale 应该接近 1.0，kd_scale 应该适中
+        kp_scale = actions[:, 0]
+        kd_scale = actions[:, 1]
 
-        # 📝 注释掉能耗奖励，专注于位置控制性能
-        # # 4. 能耗奖励（已移除）
-        # energy_cost = torch.sum(current_velocities ** 2, dim=1)
-        # energy_reward = -self.config['reward']['energy']['weight'] * energy_cost
+        # PID参数偏离理想值的惩罚
+        kp_deviation = torch.abs(kp_scale - 1.0)  # 理想kp缩放为1.0
+        kd_deviation = torch.abs(kd_scale - 0.5)  # 理想kd缩放为0.5
+        stability_penalty = self.config['reward']['stability']['weight'] * (kp_deviation + kd_deviation)
+        stability_reward = -stability_penalty
 
-        # 🏁 总奖励（去除能耗奖励）
-        total_reward = accuracy_reward + speed_reward + stability_reward
+        # 🎊 4. 成功奖励（明确的目标到达信号）
+        success_threshold = self.config['reward']['accuracy']['threshold']
+        success_mask = position_errors < success_threshold
+        success_reward = torch.zeros_like(position_errors)
+        success_reward[success_mask] = self.config['reward']['extra']['success_reward']
 
-        # 🎊 稀疏成功奖励（到达目标时的额外奖励）
-        success_mask = position_errors < self.config['reward']['accuracy']['threshold']
-        total_reward[success_mask] += self.config['reward']['extra']['success_reward']
+        # 🏁 5. 接近奖励（奖励接近目标的行为）
+        # 在成功阈值外但在接近范围内给予部分奖励
+        close_threshold = success_threshold * 3.0  # 3倍成功阈值
+        close_mask = (position_errors >= success_threshold) & (position_errors < close_threshold)
+        closeness_factor = 1.0 - (position_errors[close_mask] - success_threshold) / (close_threshold - success_threshold)
+        close_reward = torch.zeros_like(position_errors)
+        close_reward[close_mask] = self.config['reward']['extra']['success_reward'] * closeness_factor * 0.3
 
-        # 💾 保存误差历史用于下次计算速度奖励
+        # 📊 总奖励 = 所有奖励分量的加权和
+        total_reward = distance_reward + progress_reward + stability_reward + success_reward + close_reward
+
+        # 💾 保存误差历史用于下次计算进度奖励
         self.prev_position_errors = position_errors.clone()
 
         # 📊 调试信息（每100步打印一次）
@@ -1080,7 +1106,19 @@ class UR10ePPOEnvIsaac:
             avg_error = position_errors.mean().item()
             avg_reward = total_reward.mean().item()
             success_rate = success_mask.float().mean().item()
-            print(f"📈 步骤{self.debug_step}: 平均误差={avg_error:.4f}m, 平均奖励={avg_reward:.4f}, 成功率={success_rate:.2%}")
+            avg_distance_reward = distance_reward.mean().item()
+            avg_progress_reward = progress_reward.mean().item()
+            avg_stability_reward = stability_reward.mean().item()
+            avg_success_reward = success_reward.mean().item()
+
+            print(f"📈 步骤{self.debug_step}:")
+            print(f"   平均误差: {avg_error:.4f}m")
+            print(f"   平均奖励: {avg_reward:.4f}")
+            print(f"   成功率: {success_rate:.2%}")
+            print(f"   距离奖励: {avg_distance_reward:.4f}")
+            print(f"   进度奖励: {avg_progress_reward:.4f}")
+            print(f"   稳定性奖励: {avg_stability_reward:.4f}")
+            print(f"   成功奖励: {avg_success_reward:.4f}")
 
         return total_reward
 
