@@ -151,8 +151,8 @@ class UR10ePPOEnvIsaac:
         self.action_space_high = np.array([0.5, 0.5, 1.0])  # [kp_scale, kd_scale, ki_enable]
         self.action_space_low = np.array([-0.5, -0.5, 0.0])
 
-        # 状态空间 (16维RL-PID混合控制)
-        self.state_dim = 16
+        # 状态空间 (18维：当前关节角度6 + 目标关节角度6 + 当前末端位置3 + 目标位置3)
+        self.state_dim = 18
         self.action_dim = 3
 
         # 初始化Isaac Gym
@@ -198,7 +198,9 @@ class UR10ePPOEnvIsaac:
         self.debug_step = 0  # 调试步数计数器
         self.start_joint_angles = None
         self.target_positions = None
+        self.target_joint_angles = None  # 🎯 新增：目标关节角度
         self.prev_position_errors = None
+        self.prev_joint_errors = None  # 🎯 新增：上次关节角度误差
 
         print(f"✅ Isaac Gym UR10e环境初始化完成")
         print(f"   并行环境数: {num_envs}")
@@ -516,7 +518,7 @@ class UR10ePPOEnvIsaac:
 
     def _create_tensor_views(self):
         """创建GPU张量视图"""
-        # 观测空间
+        # 观测空间 (更新为18维)
         self.obs_buf = torch.zeros(
             (self.num_envs, self.state_dim),
             device=self.device, dtype=torch.float32
@@ -625,8 +627,9 @@ class UR10ePPOEnvIsaac:
         # 随机生成起始关节角度
         self.start_joint_angles = self._sample_random_joint_angles_batch()
 
-        # 随机生成目标位置
-        self.target_positions = self._sample_random_target_positions_batch()
+        # 🎯 随机生成目标关节角度，然后用正运动学生成目标位置
+        self.target_joint_angles = self._sample_target_joint_angles_batch()
+        self.target_positions = self._compute_positions_from_joint_angles(self.target_joint_angles)
 
         # 设置初始状态（参考 isaac_gym_manipulator 模式，避免CUDA内存错误）
         # 直接使用 start_idx:end_idx 批量设置，而不是逐个索引
@@ -665,6 +668,7 @@ class UR10ePPOEnvIsaac:
         self.current_step = 0
         self.episode_steps.zero_()  # 重置每个环境的episode步数
         self.prev_position_errors = torch.ones(self.num_envs, device=self.device) * 10.0
+        self.prev_joint_errors = torch.ones(self.num_envs, device=self.device) * 10.0  # 🎯 重置关节误差
 
         # 重置奖励归一化器
         for normalizer in self.reward_normalizers:
@@ -805,6 +809,36 @@ class UR10ePPOEnvIsaac:
 
         return target_positions
 
+    def _sample_target_joint_angles_batch(self) -> torch.Tensor:
+        """
+        🎯 直接采样随机的目标关节角度，然后用正运动学生成目标位置
+
+        避免复杂的逆运动学计算，确保目标位置是可达的
+        """
+        target_joint_angles = torch.zeros((self.num_envs, 6), device=self.device)
+
+        # 在工作空间内随机生成关节角度
+        for i in range(6):
+            low, high = self.joint_limits[i]
+            # 使用较小的范围确保在工作空间内
+            safe_low = low * 0.5
+            safe_high = high * 0.5
+            target_joint_angles[:, i] = torch.rand(self.num_envs, device=self.device) * (safe_high - safe_low) + safe_low
+
+        return target_joint_angles
+
+    def _compute_positions_from_joint_angles(self, joint_angles: torch.Tensor) -> torch.Tensor:
+        """
+        🎯 通过正运动学从关节角度计算末端位置
+
+        Args:
+            joint_angles: [num_envs, 6] 关节角度
+
+        Returns:
+            positions: [num_envs, 3] 末端位置
+        """
+        return self._compute_end_effector_positions_batch(joint_angles)
+
     def _get_states(self) -> torch.Tensor:
         """获取所有环境的当前状态"""
         states = torch.zeros((self.num_envs, self.state_dim), device=self.device)
@@ -812,49 +846,111 @@ class UR10ePPOEnvIsaac:
         # 获取当前关节角度和速度
         current_angles, current_velocities = self._get_joint_angles_and_velocities()
 
-        # 计算末端位置（这里需要Isaac Gym的前向动力学）
+        # 计算末端位置
         current_positions = self._compute_end_effector_positions_batch(current_angles)
 
-        # 构建状态向量 (16维RL-PID混合控制)
-        # [current_angles(6), current_velocities(6), current_position(3), distance_to_target(1)]
-        distance_to_target = torch.norm(current_positions - self.target_positions, dim=1, keepdim=True)
-
+        # 🎯 构建状态向量 (18维：当前关节角度6 + 目标关节角度6 + 当前末端位置3 + 目标位置3)
+        # [current_angles(6), target_joint_angles(6), current_position(3), target_position(3)]
         states[:, 0:6] = current_angles
-        states[:, 6:12] = current_velocities
+        states[:, 6:12] = self.target_joint_angles
         states[:, 12:15] = current_positions
-        states[:, 15] = distance_to_target.squeeze()
+        states[:, 15:18] = self.target_positions
 
         # 设备一致性检查
         if hasattr(self, '_debug_mode') and self._debug_mode:
-            if not check_tensor_devices({'states': states, 'target_positions': self.target_positions}, "_get_states"):
-                print(f"⚠️ _get_states设备不一致: states在{states.device}, target_positions在{self.target_positions.device}")
+            if not check_tensor_devices({'states': states, 'target_positions': self.target_positions, 'target_joint_angles': self.target_joint_angles}, "_get_states"):
+                print(f"⚠️ _get_states设备不一致")
 
         return states
 
     def _compute_end_effector_positions_batch(self, joint_angles: torch.Tensor) -> torch.Tensor:
-        """批量计算末端执���器位置"""
+        """批量计算末端执行器位置 - 使用完整的UR10e DH参数"""
         # 确保输入张量在正确的设备上
         joint_angles = joint_angles.to(self.device)
         # 使用运动学解算器计算末端位置
         positions = torch.zeros((self.num_envs, 3), device=self.device)
 
         for i in range(self.num_envs):
-            angles_np = joint_angles[i].detach().cpu().numpy()
             if self.kinematics is not None:
+                # 使用运动学解算器（如果可用）
+                angles_np = joint_angles[i].detach().cpu().numpy()
                 T = self.kinematics.forward_kinematics(angles_np)
                 positions[i] = torch.tensor(T[:3, 3], device=self.device)
             else:
-                # 简化位置计算（近似）
-                positions[i] = torch.tensor([
-                    0.8 * np.cos(angles_np[0]) * np.cos(angles_np[1]),
-                    0.8 * np.cos(angles_np[0]) * np.sin(angles_np[1]),
-                    0.8 * np.sin(angles_np[1]) + 0.3
-                ], device=self.device)
+                # 使用完整的UR10e DH参数正运动学
+                positions[i] = self._forward_kinematics(joint_angles[i])
 
         return positions
 
+    def _forward_kinematics(self, joint_positions: torch.Tensor) -> torch.Tensor:
+        """
+        UR10e forward kinematics using all 6 joints (q1-q6) with complete DH parameters.
+
+        Args:
+            joint_positions: [6] 关节角度张量
+
+        Returns:
+            ee_pos: [3] 末端执行器位置
+        """
+        import math
+
+        # 保证是 1D 向量 [6]
+        joint_positions = joint_positions.view(-1)
+        device = joint_positions.device
+        dtype = joint_positions.dtype
+
+        # UR10e DH参数 (基于官方规格)
+        d = torch.tensor(
+            [0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655],
+            device=device, dtype=dtype
+        )
+        a = torch.tensor(
+            [0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0],
+            device=device, dtype=dtype
+        )
+        alpha = torch.tensor(
+            [math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0],
+            device=device, dtype=dtype
+        )
+
+        # DH 变换函数
+        def dh_transform(theta, d_i, a_i, alpha_i):
+            ct = torch.cos(theta)
+            st = torch.sin(theta)
+            ca = torch.cos(alpha_i)
+            sa = torch.sin(alpha_i)
+
+            T = torch.zeros((4, 4), device=device, dtype=dtype)
+            T[0, 0] = ct
+            T[0, 1] = -st * ca
+            T[0, 2] = st * sa
+            T[0, 3] = a_i * ct
+
+            T[1, 0] = st
+            T[1, 1] = ct * ca
+            T[1, 2] = -ct * sa
+            T[1, 3] = a_i * st
+
+            T[2, 0] = 0.0
+            T[2, 1] = sa
+            T[2, 2] = ca
+            T[2, 3] = d_i
+
+            T[3, 3] = 1.0
+            return T
+
+        # 累积变换
+        T_cum = torch.eye(4, device=device, dtype=dtype)
+        for i in range(6):
+            T_i = dh_transform(joint_positions[i], d[i], a[i], alpha[i])
+            T_cum = T_cum @ T_i
+
+        # 返回末端位置
+        ee_pos = T_cum[:3, 3]
+        return ee_pos
+
     def _apply_rl_pid_control(self, actions: torch.Tensor):
-        """应用RL-PID控制（使用Isaac Gym官方franka_osc.py的正确模式）"""
+        """应用RL-PID控制（移除雅可比依赖，直接关节空间控制）"""
         # 解析动作
         kp_scale = actions[:, 0]
         kd_scale = actions[:, 1]
@@ -862,62 +958,62 @@ class UR10ePPOEnvIsaac:
 
         # 获取当前状态
         current_angles, current_velocities = self._get_joint_angles_and_velocities()
-        current_positions = self._compute_end_effector_positions_batch(current_angles)
 
-        # 计算位置误差
-        position_errors = self.target_positions - current_positions
-        distance_errors = torch.norm(position_errors, dim=1)
+        # 🎯 关键修改：直接计算关节空间误差（无雅可比）
+        joint_errors = self.target_joint_angles - current_angles  # [num_envs, 6]
+        joint_error_norms = torch.norm(joint_errors, dim=1)
 
-        # 🎯 调试信息：每100步打印一次位置和误差信息
+        # 调试信息：每100步打印一次
         if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
             print(f"\n📊 === 步骤 {self.debug_step} 调试信息 ===")
             for i in range(min(self.num_envs, 2)):  # 只打印前2个环境
                 print(f"🤖 环境{i}:")
-                print(f"   当前末端位置: [{current_positions[i].cpu().numpy().tolist()}]")
-                print(f"   目标位置: [{self.target_positions[i].cpu().numpy().tolist()}]")
-                print(f"   位置误差: [{position_errors[i].cpu().numpy().tolist()}]")
-                print(f"   距离误差: {distance_errors[i].item():.4f}m")
-                print(f"   关节角度: [{current_angles[i].cpu().numpy().tolist()}]")
+                print(f"   当前关节角度: [{current_angles[i].cpu().numpy().tolist()}]")
+                print(f"   目标关节角度: [{self.target_joint_angles[i].cpu().numpy().tolist()}]")
+                print(f"   关节误差: [{joint_errors[i].cpu().numpy().tolist()}]")
+                print(f"   误差范数: {joint_error_norms[i].item():.4f} rad")
 
-        # 批量计算所有环境的控制力矩（修复设备问题：Isaac Gym期望CPU张量）
-        # 初始化力矩张量 [num_envs, num_dofs, 1] - 必须是CPU张量！
+        # 使用官方UR10e PID参数
+        base_kp = self.config['pid_params']['base_gains']['p']
+        base_kd = self.config['pid_params']['base_gains']['d']
+
+        # UR10e力矩限制
+        ur10e_torque_limits = [330.0, 330.0, 150.0, 54.0, 54.0, 54.0]
+
+        # 批量计算所有环境的控制力矩（Isaac Gym期望CPU张量）
         all_dof_forces = torch.zeros(self.num_envs, 6, 1, device='cpu')
 
-        # 为每个环境计算控制力矩
+        # 🎯 新的控制逻辑：直接关节空间PID控制（无雅可比）
         for i in range(self.num_envs):
-            if distance_errors[i] > 1e-4:  # 只在有效时计算
-                joint_control = self._compute_jacobian_control(
-                    current_angles[i], current_velocities[i],
-                    position_errors[i], actions[i]
-                )
+            # RL调度PID参数
+            kp = [base_kp[j] * kp_scale[i] for j in range(6)]
+            kd = [base_kd[j] * kd_scale[i] for j in range(6)]
 
-                # UR10e官方力矩限制 (N⋅m)
-                ur10e_torque_limits = [330.0, 330.0, 150.0, 54.0, 54.0, 54.0]  # 基于官方URDF配置
+            for j in range(6):
+                # 比例项：关节角度误差（与DDPG相同的逻辑）
+                p_term = kp[j] * joint_errors[i, j]
+
+                # 阻尼项：关节速度（目标速度为0）
+                d_term = kd[j] * current_velocities[i, j]
+
+                # 控制力矩（P-D控制）
+                control_torque = p_term - d_term
+
+                # 力矩限制（使用80%安全范围）
+                max_torque = ur10e_torque_limits[j] * 0.8
+                control_torque = torch.clamp(control_torque, -max_torque, max_torque)
+
+                # 设置到力矩张量
+                all_dof_forces[i, j, 0] = control_torque.cpu().item()
+
+            # 调试信息（仅第一个环境，每100步输出一次）
+            if i == 0 and hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
+                forces_list = all_dof_forces[i, :, 0].numpy()  # 已经在CPU上
                 joint_names = ['shoulder_pan', 'shoulder_lift', 'elbow_joint', 'wrist_1', 'wrist_2', 'wrist_3']
-
-                # 将计算出的力矩放入张量（处理设备转移：GPU计算 -> CPU存储）
-                for j in range(6):  # 6个关节
-                    # 提取力矩值并确保张量格式
-                    if isinstance(joint_control[j], torch.Tensor):
-                        force_value = joint_control[j]
-                    else:
-                        force_value = torch.tensor(float(joint_control[j]), device=self.device)
-
-                    # 使用UR10e官方力矩限制
-                    max_torque = ur10e_torque_limits[j]
-                    min_torque = -max_torque
-                    force_value = torch.clamp(force_value, min_torque, max_torque)
-
-                    # 关键修复：转移到CPU标量值以匹配CPU张量
-                    all_dof_forces[i, j, 0] = force_value.cpu().item()
-
-                # 调试信息（仅第一个环境，每100步输出一次）
-                if i == 0 and hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
-                    forces_list = all_dof_forces[i, :, 0].numpy()  # 已经在CPU上
-                    print(f"   🔧 应用力矩: [{forces_list.tolist()}] N⋅m")
-                    for j, (name, force, limit) in enumerate(zip(joint_names, forces_list, ur10e_torque_limits)):
-                        saturation = abs(force) / limit * 100
-                        print(f"      {j+1}. {name:12}: {force:7.2f} N⋅m (限制: ±{limit:5.1f}, 饱和度: {saturation:5.1f}%)")
+                print(f"   🔧 应用力矩: [{forces_list.tolist()}] N⋅m")
+                for j, (name, force, limit) in enumerate(zip(joint_names, forces_list, ur10e_torque_limits)):
+                    saturation = abs(force) / limit * 100
+                    print(f"      {j+1}. {name:12}: {force:7.2f} N⋅m (限制: ±{limit:5.1f}, 饱和度: {saturation:5.1f}%)")
 
         # 🎯 Isaac Gym官方API：确保力矩张量在CPU上再unwrap（修复设备不匹配）
         # 参考: gym.set_dof_actuation_force_tensor(sim, gymtorch.unwrap_tensor(u))
@@ -938,204 +1034,156 @@ class UR10ePPOEnvIsaac:
             print(f"   力矩张量类型: {all_dof_forces.dtype}")
             print(f"   力矩范数: {torch.norm(all_dof_forces)}")
 
-    def _compute_jacobian_control(self, current_angles: torch.Tensor,
-                                current_velocities: torch.Tensor,
-                                position_error: torch.Tensor,
-                                action: torch.Tensor) -> torch.Tensor:
-        """计算基于雅可比的控制"""
-        kp_scale, kd_scale, ki_enable = action
-
-        # 映射缩放因子
-        kp_scale = 0.1 + kp_scale * 2.0  # [0.1, 2.1]
-        kd_scale = 0.1 + kd_scale * 2.0  # [0.1, 2.1]
-        ki_enable = max(0.0, ki_enable)   # [0.0, 1.0+]
-
-        # 🎯 使用官方UR10e PID参数（来自isaac_gym_manipulator官方配置）
-        # 参考: /isaac_gym_manipulator/ros_sources/universal_robot/ur_gazebo/config/ur10e_controllers.yaml
-        base_kp = self.config['pid_params']['base_gains']['p']
-        base_kd = self.config['pid_params']['base_gains']['d']
-        base_ki = self.config['pid_params']['base_gains']['i']
-
-        # RL调度参数（每个关节分别计算）
-        kp = [base_kp[i] * kp_scale for i in range(6)]
-        kd = [base_kd[i] * kd_scale for i in range(6)]
-        ki = [base_ki[i] * ki_enable for i in range(6)]
-
-        # 计算雅可比矩阵（简化版本）
-        jacobian = self._compute_jacobian_batch(current_angles.unsqueeze(0))[0]
-
-        # 🎯 ��化：每个关节使用各自的kp进行控制（参考原始MuJoCo实现）
-        joint_control = torch.zeros(6, device=self.device)
-
-        # 🎯 改进：雅可比矩阵稳定性检查
-        jacobian_det = torch.det(jacobian @ jacobian.T)
-        if torch.abs(jacobian_det) < 1e-6:
-            # 雅可比矩阵接近奇异，使用简化控制
-            joint_position_errors = position_error.repeat(6) * 0.1
-        else:
-            # 正常情况：转换任务空间误差到关节空间
-            joint_position_errors = jacobian.T @ position_error
-
-        # 每个关节使用各自的kp、kd进行控制（增加稳定性）
-        joint_control = torch.zeros(6, device=self.device)
-        ur10e_torque_limits = [330.0, 330.0, 150.0, 54.0, 54.0, 54.0]  # N⋅m
-
-        for i in range(6):
-            # 比例项：每个关节使用各自的kp
-            p_term = kp[i] * joint_position_errors[i]
-
-            # 阻尼项：每个关节使用各自的kd
-            d_term = kd[i] * current_velocities[i]
-
-            # 🎯 改进：添加饱和和限制，避免力矩过大
-            control_torque = p_term - d_term
-
-            # 力矩限制
-            max_torque = ur10e_torque_limits[i] * 0.8  # 使用80%的安全限制
-            control_torque = torch.clamp(control_torque, -max_torque, max_torque)
-
-            # 关节控制力矩
-            joint_control[i] = control_torque
-
-        return joint_control
-
-    def _compute_jacobian_batch(self, joint_angles: torch.Tensor) -> torch.Tensor:
-        """批量计算雅可比矩阵"""
-        # 确保输入张量在正确的设备上
-        joint_angles = joint_angles.to(self.device)
-        batch_size = joint_angles.shape[0]
-        jacobian = torch.zeros((batch_size, 3, 6), device=self.device)
-        epsilon = 1e-6
-
-        for i in range(batch_size):
-            angles_np = joint_angles[i].detach().cpu().numpy()
-            jacobian_np = self._compute_jacobian_single(angles_np)
-            jacobian[i] = torch.tensor(jacobian_np, device=self.device)
-
-        return jacobian
-
-    def _compute_jacobian_single(self, joint_angles: np.ndarray) -> np.ndarray:
-        """计算单个雅可比矩阵"""
-        if self.kinematics is not None:
-            current_pos = self.kinematics.get_end_effector_position(joint_angles)
-            jacobian = np.zeros((3, 6))
-
-            # 数值微分
-            for i in range(6):
-                delta_q = np.zeros(6)
-                delta_q[i] = 1e-6
-
-                perturbed_pos = self.kinematics.get_end_effector_position(joint_angles + delta_q)
-                jacobian[:, i] = (perturbed_pos - current_pos) / 1e-6
-
-            return jacobian
-        else:
-            # 简化雅可比矩阵近似
-            return np.eye(3, 6) * 0.1
-
-    def _compute_rewards_batch(self, actions: torch.Tensor) -> torch.Tensor:
+    def _compute_rewards_batch_(self, actions: torch.Tensor) -> torch.Tensor:
         """
-        🎯 重新设计的学习友好型奖励函数
+        🎯 新的奖励函数：主要基于关节角度误差，次要基于末端位置误差
 
-        新的设计原则：
-        1. 温和的距离惩罚，避免巨大的负奖励
-        2. 明确的进度奖励，鼓励向目标移动
-        3. 合理的成功奖励，提供明确的目标信号
-        4. 适中的稳定性控制，避免过度约束
-
-        Args:
-            actions: PID调度动作 [num_envs, 3]
-
-        Returns:
-            rewards: 奖励值 [num_envs]
+        学习目标：RL调度PID参数，使关节角度快速到达目标
         """
         # 获取当前状态
         current_angles, current_velocities = self._get_joint_angles_and_velocities()
         current_positions = self._compute_end_effector_positions_batch(current_angles)
 
-        # 计算位置误差
+        # 🎯 1. 关节角度误差奖励（主要奖励）
+        joint_errors = self.target_joint_angles - current_angles
+        joint_error_norms = torch.norm(joint_errors, dim=1)
+
+        # 关节角度惩罚（线性惩罚，避免过度惩罚）
+        max_joint_error = 1.0  # 最大期望关节误差（弧���）
+        normalized_joint_error = torch.clamp(joint_error_norms / max_joint_error, 0.0, 1.0)
+        joint_reward = -2.0 * normalized_joint_error  # 主要奖励权重
+
+        # 🏃 2. 关节进度奖励（奖励误差减少）
+        joint_progress_reward = torch.zeros_like(joint_error_norms)
+        if self.prev_joint_errors is not None:
+            joint_error_reduction = self.prev_joint_errors - joint_error_norms
+            joint_progress_reward = 1.0 * torch.clamp(joint_error_reduction, 0.0, max_joint_error)
+
+        # 📍 3. 末端位置误差奖励（次要奖励）
         position_errors = torch.norm(self.target_positions - current_positions, dim=1)
-
-        # 🎯 1. 温和的距离奖励（使用线性惩罚而非指数惩罚）
-        # r_distance = -w_d * distance，确保奖励在合理范围内
-        max_distance = 1.0  # 最大期望距离
+        max_distance = 1.0
         normalized_distance = torch.clamp(position_errors / max_distance, 0.0, 1.0)
-        distance_reward = -self.config['reward']['accuracy']['weight'] * normalized_distance
+        position_reward = -0.5 * normalized_distance  # 次要奖励权重
 
-        # 🏃 2. 进度奖励（奖励误差减少）
-        progress_reward = torch.zeros_like(position_errors)
-        if self.prev_position_errors is not None:
-            error_reduction = self.prev_position_errors - position_errors
-            # 只奖励误差减少，忽略误差增加
-            progress_reward = self.config['reward']['progress']['weight'] * torch.clamp(error_reduction, 0.0, max_distance)
-
-        # 🔧 3. 稳定性奖励（温和的PID参数约束）
-        # 鼓励使用适中的PID参数，避免极端值
-        # kp_scale 应该接近 1.0，kd_scale 应该适中
-        kp_scale = actions[:, 0]
-        kd_scale = actions[:, 1]
+        # 🔧 4. PID参数稳定性奖励
+        kp_scale, kd_scale, ki_enable = actions[:, 0], actions[:, 1], actions[:, 2]
 
         # PID参数偏离理想值的惩罚
         kp_deviation = torch.abs(kp_scale - 1.0)  # 理想kp缩放为1.0
         kd_deviation = torch.abs(kd_scale - 0.5)  # 理想kd缩放为0.5
-        stability_penalty = self.config['reward']['stability']['weight'] * (kp_deviation + kd_deviation)
+        stability_penalty = 0.1 * (kp_deviation + kd_deviation)
         stability_reward = -stability_penalty
 
-        # 🎊 4. 成功奖励（明确的目标到达信号）
-        success_threshold = self.config['reward']['accuracy']['threshold']
-        success_mask = position_errors < success_threshold
-        success_reward = torch.zeros_like(position_errors)
-        success_reward[success_mask] = self.config['reward']['extra']['success_reward']
+        # 🎊 5. 关节到达成功奖励
+        joint_success_threshold = 0.1  # 0.1弧度约5.7度
+        joint_success_mask = joint_error_norms < joint_success_threshold
+        joint_success_reward = torch.zeros_like(joint_error_norms)
+        joint_success_reward[joint_success_mask] = 5.0
 
-        # 🏁 5. 接近奖励（奖励接近目标的行为）
-        # 在成功阈值外但在接近范围内给予部分奖励
-        close_threshold = success_threshold * 3.0  # 3倍成功阈值
-        close_mask = (position_errors >= success_threshold) & (position_errors < close_threshold)
-        closeness_factor = 1.0 - (position_errors[close_mask] - success_threshold) / (close_threshold - success_threshold)
-        close_reward = torch.zeros_like(position_errors)
-        close_reward[close_mask] = self.config['reward']['extra']['success_reward'] * closeness_factor * 0.3
+        # 🎊 6. 末端位置成功奖励（额外奖励）
+        position_success_threshold = 0.05  # 5cm
+        position_success_mask = position_errors < position_success_threshold
+        position_success_reward = torch.zeros_like(position_errors)
+        position_success_reward[position_success_mask] = 2.0
 
-        # 📊 总奖励 = 所有奖励分量的加权和
-        total_reward = distance_reward + progress_reward + stability_reward + success_reward + close_reward
+        # 📊 总奖励
+        total_reward = (joint_reward + joint_progress_reward + position_reward +
+                       stability_reward + joint_success_reward + position_success_reward)
 
-        # 💾 保存误差历史用于下次计算进度奖励
+        # 💾 保存历史用于下次计算进度奖励
+        self.prev_joint_errors = joint_error_norms.clone()
         self.prev_position_errors = position_errors.clone()
 
         # 📊 调试信息（每100步打印一次）
         if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
-            avg_error = position_errors.mean().item()
+            avg_joint_error = joint_error_norms.mean().item()
+            avg_position_error = position_errors.mean().item()
             avg_reward = total_reward.mean().item()
-            success_rate = success_mask.float().mean().item()
-            avg_distance_reward = distance_reward.mean().item()
-            avg_progress_reward = progress_reward.mean().item()
-            avg_stability_reward = stability_reward.mean().item()
-            avg_success_reward = success_reward.mean().item()
+            joint_success_rate = joint_success_mask.float().mean().item()
+            position_success_rate = position_success_mask.float().mean().item()
 
             print(f"📈 步骤{self.debug_step}:")
-            print(f"   平均误差: {avg_error:.4f}m")
+            print(f"   平均关节误差: {avg_joint_error:.4f} rad ({avg_joint_error*180/3.14159:.1f}°)")
+            print(f"   平均位置误差: {avg_position_error:.4f}m")
             print(f"   平均奖励: {avg_reward:.4f}")
-            print(f"   成功率: {success_rate:.2%}")
-            print(f"   距离奖励: {avg_distance_reward:.4f}")
-            print(f"   进度奖励: {avg_progress_reward:.4f}")
-            print(f"   稳定性奖励: {avg_stability_reward:.4f}")
-            print(f"   成功奖励: {avg_success_reward:.4f}")
+            print(f"   关节成功率: {joint_success_rate:.2%}")
+            print(f"   位置成功率: {position_success_rate:.2%}")
 
         return total_reward
+    
+    def _compute_rewards_batch(self, actions):
+        current_angles, current_vels = self._get_joint_angles_and_velocities()
+        current_pos = self._compute_end_effector_positions_batch(current_angles)
+
+        joint_errors = self.target_joint_angles - current_angles
+        pos_errors = self.target_positions - current_pos
+
+        # ---- LQR reward components ----
+        w1, w2, w3, w4 = 2.0, 0.1, 1.0, 0.05
+
+        r_joint = -w1 * torch.sum(joint_errors ** 2, dim=1)
+        r_vel = -w2 * torch.sum(current_vels ** 2, dim=1)
+        r_pos = -w3 * torch.sum(pos_errors ** 2, dim=1)
+
+        # ---- RL scaling actions (kp,kd coefficients) ----
+        kp_scale = actions[:, 0]
+        kd_scale = actions[:, 1]
+
+        r_action = -w4 * ((kp_scale - 1.0)**2 + (kd_scale - 0.5)**2)
+
+        total_reward = r_joint + r_vel + r_pos + r_action
+
+        # ---- Debug print ----
+        if self.debug_step % 100 == 0:
+            print("=== Reward Debug ===")
+            print(f"joint_error:{torch.mean(torch.norm(joint_errors,dim=1)):.4f} rad")
+            print(f"pos_error:  {torch.mean(torch.norm(pos_errors,dim=1)):.4f} m")
+            print(f"vel_norm:   {torch.mean(torch.norm(current_vels,dim=1)):.4f} rad/s")
+            print(f"kp_scale:   {kp_scale.mean().item():.3f}")
+            print(f"kd_scale:   {kd_scale.mean().item():.3f}")
+            print(f"reward_avg: {total_reward.mean().item():.4f}")
+            print("====================")
+
+        self.debug_step += 1
+        return total_reward
+
 
     def _check_done_batch(self) -> torch.Tensor:
-        """检查完成条件"""
-        # 获取当前位置
+        """检查完成条件（主要基于关节角度到达）"""
+        # 获取当前状态
         current_angles, _ = self._get_joint_angles_and_velocities()
         current_positions = self._compute_end_effector_positions_batch(current_angles)
 
-        # 计算位置误差
+        # 🎯 主要条件：关节角度到达
+        joint_errors = self.target_joint_angles - current_angles
+        joint_error_norms = torch.norm(joint_errors, dim=1)
+        joint_success_threshold = 0.1  # 0.1弧度约5.7度
+        joint_success = joint_error_norms < joint_success_threshold
+
+        # 📍 次要条件：末端位置到达（额外成功条件）
         position_errors = torch.norm(self.target_positions - current_positions, dim=1)
+        position_success_threshold = 0.05  # 5cm
+        position_success = position_errors < position_success_threshold
 
-        # 完成条件：成功到达或超过最大步数
-        success_done = position_errors < self.config['reward']['accuracy']['threshold']
-        timeout_done = self.episode_steps >= self.max_steps  # 使用每个环境的episode步数
+        # ⏰ 超时条件
+        #timeout_done = self.episode_steps >= self.max_steps
+        timeout_done = (self.episode_steps + 1) >= self.max_steps
 
-        return success_done | timeout_done
+        # 🎯 完成条件：关节成功 OR 位置成功 OR 超时
+        done = joint_success | position_success | timeout_done
+
+        # 📊 调试信息（每100步打印一次）
+        if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
+            joint_success_rate = joint_success.float().mean().item()
+            position_success_rate = position_success.float().mean().item()
+            timeout_rate = timeout_done.float().mean().item()
+
+            print(f"🏁 步骤{self.debug_step} Done状态:")
+            print(f"   关节成功: {joint_success_rate:.2%}")
+            print(f"   位置成功: {position_success_rate:.2%}")
+            print(f"   超时: {timeout_rate:.2%}")
+
+        return done
 
     def _get_dof_state_indices(self, env_idx: int):
         """获取指定环境的DOF状态索引"""

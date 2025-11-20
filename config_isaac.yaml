@@ -4,8 +4,8 @@
 # 环境配置
 env:
   num_envs: 2                    # 并行环境数量
-  max_steps: 500                 # 增加最大步数，给足够时间到达目标
-  device_id: 2                   # GPU设备ID (用户服务器使用GPU 2)
+  max_steps: 512                 # 增加最大步数，给足够时间到达目标
+  device_id: 0                   # GPU设备ID (用户服务器使用GPU 2)
   dt: 0.01                       # 100Hz，与MuJoCo原始配置一致
 
   # 🎯 目标位置范围 (UR10e舒适工作区)
@@ -16,9 +16,9 @@ env:
     z: [0.1, 0.8]                # Z轴范围 (避免过高或过低的目标)
 
 # 🎯 设备配置（参考isaac_gym_manipulator方案）
-device: "cuda:2"                 # PyTorch设备 (用户服务器使用GPU 2)
+device: "cuda:0"                 # PyTorch设备 (用户服务器使用GPU 2)
 sim:
-  device_id: 2                  # Isaac Gym仿真设备ID (用户服务器使用GPU 2)
+  device_id: 0                  # Isaac Gym仿真设备ID (用户服务器使用GPU 2)
   # 物理引擎配置（基于isaac_gym_manipulator成功配置）
   solver_type: 1                 # 使用solver_type=1
   num_position_iterations: 4     # 位置迭代次数
@@ -57,7 +57,7 @@ ppo:
 
 # 训���配置（优化rollout策略）
 train:
-  rollout_length: 256           # 降低rollout长度，更适合500步episode
+  rollout_length: 512           # 降低rollout长度，更适合500步episode
   batch_size: 32                 # 批次大小
   num_updates: 10                # 每次收集后更新次数
   num_episodes: 10000            # 总训练回合数
@@ -66,43 +66,44 @@ train:
   save_interval: 100             # 保存间隔
   log_interval: 10               # 日志间隔
 
-# 🎯 重新设计的奖励函数配置（学习友好型）
+# 🎯 新的奖励函数配置（基于关节角度误差）
 reward:
-  # 🎯 距离奖励（温和的线性惩罚）
+  # 🎯 关节角度误差奖励（主要奖励）
   accuracy:
-    weight: 2.0                  # 降低精度权重，避免过度惩罚
-    threshold: 0.005             # 放宽成功阈值到5厘米（更现实）
+    weight: 2.0                  # 关节角度误差权重
+    threshold: 0.05              # 末端位置成功阈值（次要）
 
-  # 🏃 进度奖励（奖励向目标移动的行为）
+  # 🏃 关节进度奖励（奖励误差减少）
   progress:
-    weight: 3.0                  # 增加进度奖励权重，鼓励主动接近
+    weight: 1.0                  # 关节角度误差减少权重
 
-  # 🔧 稳定性奖励（PID参数合理性约束）
+  # 📍 末端位置误差奖励（次要奖励）
+  position:
+    weight: 0.5                  # 末端位置误差权重
+
+  # 🔧 PID参数稳定性奖励
   stability:
-    weight: 0.3                  # 降低稳定性权重，允许更多探索
+    weight: 0.1                  # PID参数合理性约束权重
 
-  # 🎊 成功奖励（明确的目标到达信号）
+  # 🎊 成功奖励
   extra:
-    success_reward: 5.0          # 降低成功奖励，避免过度依赖稀疏奖励
+    success_reward: 5.0          # 关节到达成功奖励
+    position_success_reward: 2.0  # 末端位置成功奖励
 
-  # 📝 已移除：能耗效率奖励（专注于位置控制性能）
-  # energy:
-  #   weight: 0.001                # 能耗权重
-
-# UR10e官方PID参数配置（基于isaac_gym_manipulator官方配置）
-# 参考: /isaac_gym_manipulator/ros_sources/universal_robot/ur_gazebo/config/ur10e_controllers.yaml
+# UR10e PID参数配置（基于DDPG成功案例调优）
+# 参考DDPG中的温和参数，避免过大的增益导致震荡
 pid_params:
-  # 基础PID参数（官方推荐值）
+  # 基础PID参数（调优后的温和值）
   base_gains:
     # 比例增益 P: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
-    p: [20000.0, 20000.0, 10000.0, 500.0, 500.0, 10.0]
+    p: [1500.0, 1500.0, 800.0, 300.0, 300.0, 100.0]  # DDPG成功案例的值
     # 微分增益 D: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
-    d: [100.0, 100.0, 100.0, 1.0, 1.0, 0.1]
+    d: [180.0, 180.0, 110.0, 50.0, 50.0, 50.0]        # 统一的阻尼系数
     # 积分增益 I: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
-    i: [10.0, 20.0, 10.0, 1.0, 1.0, 0.0]
+    i: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]                   # 暂时不用积分项
 
-  # 力矩限制（来自官��URDF）
-  torque_limits: [330.0, 330.0, 150.0, 54.0, 54.0, 54.0]  # N⋅m
+  # 力矩限制（保守值，确保安全）
+  torque_limits: [264.0, 264.0, 120.0, 43.2, 43.2, 43.2]  # 80% of官方限制
 
 # 网络架构配置
 network:

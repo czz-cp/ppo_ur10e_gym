@@ -25,7 +25,7 @@ from utils import (ValueNormalization, GAE, assert_same_device, check_tensor_dev
 class ActorNetwork(nn.Module):
     """Actor网络 - PPO策略函数"""
 
-    def __init__(self, state_dim: int = 16, action_dim: int = 3, hidden_dim: int = 64):
+    def __init__(self, state_dim: int = 18, action_dim: int = 3, hidden_dim: int = 64):
         super().__init__()
 
         self.state_dim = state_dim
@@ -99,7 +99,7 @@ class ActorNetwork(nn.Module):
 class CriticNetwork(nn.Module):
     """Critic网络 - PPO价值函数"""
 
-    def __init__(self, state_dim: int = 16, hidden_dim: int = 64):
+    def __init__(self, state_dim: int = 18, hidden_dim: int = 64):
         super().__init__()
 
         # 价值网络
