@@ -690,8 +690,12 @@ class UR10ePPOEnvIsaac:
         self.on_goal_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # 重置奖励归一化器
+        #for normalizer in self.reward_normalizers:
+            #normalizer.reset()
+        
         for normalizer in self.reward_normalizers:
-            normalizer.reset()
+            if normalizer is not None:
+                normalizer.reset()
 
         # 推进一步
         self.gym.simulate(self.sim)
@@ -701,6 +705,67 @@ class UR10ePPOEnvIsaac:
         obs = self._get_states()
 
         return obs
+    
+    def _reset_done_envs(self, dones: torch.Tensor):
+        """只重置 dones == True 的那些环境"""
+        done_indices = torch.nonzero(dones, as_tuple=False).squeeze(-1)
+        if done_indices.numel() == 0:
+            return
+
+        # 1) 为这些 env 重新采样起始关节角 & 目标关节角/位置
+        new_start_angles = self._sample_random_joint_angles_batch()[done_indices]
+        new_target_joint_angles = self._sample_target_joint_angles_batch()[done_indices]
+        new_target_positions = self._compute_positions_from_joint_angles(new_target_joint_angles)
+
+        # 2) 写回 DOF 状态
+        for env_idx, joint_angles in zip(done_indices, new_start_angles):
+            env_idx = int(env_idx.item())
+            # 保证长度为 6
+            joint_angles = joint_angles.view(-1)
+            if joint_angles.numel() != 6:
+                if joint_angles.numel() > 6:
+                    joint_angles = joint_angles[:6]
+                else:
+                    pad = torch.zeros(6 - joint_angles.numel(), device=self.device)
+                    joint_angles = torch.cat([joint_angles, pad], dim=0)
+
+            start = env_idx * self.num_dofs
+            end = (env_idx + 1) * self.num_dofs
+            self.dof_states[start:end, 0] = joint_angles.to(self.device)  # 位置
+            self.dof_states[start:end, 1] = 0.0                           # 速度置零
+
+        # 3) 更新这些 env 的 target 变量
+        self.target_joint_angles[done_indices] = new_target_joint_angles
+        self.target_positions[done_indices] = new_target_positions
+
+        # 4) 把 DOF 状态写回 Isaac Gym
+        if self.dof_states.device.type != 'cpu':
+            dof_states_cpu = self.dof_states.cpu()
+        else:
+            dof_states_cpu = self.dof_states
+        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(dof_states_cpu))
+
+        # 5) 为新 episode 稍微稳定几步
+        for _ in range(10):
+            self.gym.simulate(self.sim)
+            self.gym.fetch_results(self.sim, True)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_dof_state_tensor(self.sim)
+
+        # 6) 重置这些 env 的内部计数器
+        self.episode_steps[done_indices] = 0
+        self.on_goal_count[done_indices] = 0
+        if self.prev_position_errors is not None:
+            self.prev_position_errors[done_indices] = 10.0
+        if self.prev_joint_errors is not None:
+            self.prev_joint_errors[done_indices] = 10.0
+
+        # 7) 重置对应的奖励归一化器（如果你还在用的话）
+        for env_idx in done_indices.cpu().tolist():
+            if (0 <= env_idx < len(self.reward_normalizers)
+                    and self.reward_normalizers[env_idx] is not None):
+                self.reward_normalizers[env_idx].reset()
+
 
     def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """
@@ -767,9 +832,16 @@ class UR10ePPOEnvIsaac:
         dones = self._check_done_batch()
 
         # 处理完成的episode - 重置相关状态
-        for i in range(self.num_envs):
-            if dones[i]:
-                self.episode_steps[i] = 0  # 重置该环境的episode步数
+        #for i in range(self.num_envs):
+        #    if dones[i]:
+        #        self.episode_steps[i] = 0  # 重置该环境的episode步数
+        
+        # ⭐ 对 done 的环境做真正的 reset：重采样起点/目标，写回 dof_states 等
+        self._reset_done_envs(dones)
+
+        # 对于被 reset 的环境，把 obs 换成“新 episode 的初始观测”
+        if dones.any():
+            obs = self._get_states()
 
         # 更新奖励归一化器
         """for i in range(self.num_envs):
@@ -882,8 +954,8 @@ class UR10ePPOEnvIsaac:
 
         return states
 
-    def _compute_end_effector_positions_batch(self, joint_angles: torch.Tensor) -> torch.Tensor:
-        """批量计算末端执行器位置 - 使用完整的UR10e DH参数"""
+    """def _compute_end_effector_positions_batch(self, joint_angles: torch.Tensor) -> torch.Tensor:
+        批量计算末端执行器位置 - 使用完整的UR10e DH参数
         # 确保输入张量在正确的设备上
         joint_angles = joint_angles.to(self.device)
         # 使用运动学解算器计算末端位置
@@ -899,7 +971,27 @@ class UR10ePPOEnvIsaac:
                 # 使用完整的UR10e DH参数正运动学
                 positions[i] = self._forward_kinematics(joint_angles[i])
 
+        return positions"""
+    
+    def _compute_end_effector_positions_batch(self, joint_angles: torch.Tensor) -> torch.Tensor:
+        """批量计算末端执行器位置"""
+        # joint_angles: [B, 6]，B 可以是 num_envs，也可以是 len(done_indices)
+
+        joint_angles = joint_angles.to(self.device)
+        batch_size = joint_angles.shape[0]
+
+        positions = torch.zeros((batch_size, 3), device=self.device)
+
+        for i in range(batch_size):
+            if self.kinematics is not None:
+                angles_np = joint_angles[i].detach().cpu().numpy()
+                T = self.kinematics.forward_kinematics(angles_np)
+                positions[i] = torch.tensor(T[:3, 3], device=self.device)
+            else:
+                positions[i] = self._forward_kinematics(joint_angles[i])
+
         return positions
+
 
     def _forward_kinematics(self, joint_positions: torch.Tensor) -> torch.Tensor:
         """

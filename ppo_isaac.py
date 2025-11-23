@@ -88,11 +88,9 @@ class ActorNetwork(nn.Module):
         action = dist.sample()
         log_prob = dist.log_prob(action).sum(dim=-1)
 
-        # ���� 修复：裁剪动作到PID参数合理范围 (确保kp为正)
-        # kp_scale: [0.1, 2.0] - 比例增益缩放，必须为正
-        # kd_scale: [0.0, 1.0] - 微分增益缩放
-        # ki_scale: [0.0, 0.5] - 积分增益缩放
-        action = torch.clamp(action, 0.1, 2.0)
+        max_tau = 30.0
+        action = torch.clamp(action, -max_tau, max_tau)
+        #action = torch.clamp(action, 0.1, 2.0)
 
         return action, log_prob
 
@@ -595,8 +593,15 @@ class PPOIsaac:
         print(f"🚀 开始训练，目标回合数: {num_episodes}")
         print(f"   按 Ctrl+C 可安全退出训练")
 
+        
+        
         # 创建保存目录
         os.makedirs(save_dir, exist_ok=True)
+
+        # 🔹 初始化 loss 日志文件
+        loss_log_path = os.path.join(save_dir, "loss_curve.csv")
+        with open(loss_log_path, "w") as f:
+            f.write("log_step,episode,actor_loss,critic_loss,entropy,mean_return\n")
 
         # 训练统计
         training_stats = {
@@ -633,6 +638,15 @@ class PPOIsaac:
                       f"Critic Loss: {metrics['critic_loss']:8.4f} | "
                       f"Policy Std: {metrics['policy_std']:6.4f} | "
                       f"Time: {current_time/60:6.2f}min")
+                
+                 # 🔹 追加一行到 CSV（每 10 个 episode 记一次）
+                log_step = len(training_stats['actor_losses'])
+                with open(loss_log_path, "a") as f:
+                    f.write(
+                        f"{log_step},{episode},"
+                        f"{metrics['actor_loss']:.6f},{metrics['critic_loss']:.6f},"
+                        f"{metrics['entropy']:.6f},{metrics['mean_return']:.6f}\n"
+                    )
 
                 # 记录训练统计
                 training_stats['actor_losses'].append(metrics['actor_loss'])

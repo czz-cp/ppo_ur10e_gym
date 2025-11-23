@@ -3,8 +3,8 @@
 
 # 环境配置
 env:
-  num_envs: 2                    # 并行环境数量
-  max_steps: 512                 # 增加最大步数，给足够时间到达目标
+  num_envs: 1                    # 并行环境数量
+  max_steps: 256                 # 增加最大步数，给足够时间到达目标
   device_id: 0                   # GPU设备ID (用户服务器使用GPU 2)
   dt: 0.01                       # 100Hz，与MuJoCo原始配置一致
 
@@ -31,10 +31,10 @@ sim:
   substeps: 2                    # 使用2个子步骤，提高仿真稳定性
 
 graphics:
-  graphics_device_id: 2          # 图形设备ID (用户服务器使用GPU 2)
+  graphics_device_id: 0          # 图形设备ID (用户服务器使用GPU 2)
 
 visualization:
-  enable: false                   # 启用可视化（参考isaac_gym_manipulator）
+  enable: true                   # 启用可视化（参考isaac_gym_manipulator）
   render_freq: 1                 # 渲染频率
 
 # PPO算法配置（优化超参数）

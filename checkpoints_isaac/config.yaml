@@ -6,8 +6,8 @@ device: cuda:0
 env:
   device_id: 0
   dt: 0.01
-  max_steps: 512
-  num_envs: 2
+  max_steps: 256
+  num_envs: 1
   target_range:
     x:
     - -0.6
@@ -19,7 +19,7 @@ env:
     - 0.1
     - 0.8
 graphics:
-  graphics_device_id: 2
+  graphics_device_id: 0
 network:
   actor:
     activation: relu
@@ -110,5 +110,5 @@ value_normalization:
   enabled: true
   epsilon: 1e-5
 visualization:
-  enable: false
+  enable: true
   render_freq: 1
