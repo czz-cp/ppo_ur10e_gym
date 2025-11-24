@@ -96,9 +96,9 @@ pid_params:
   # 基础PID参数（调优后的温和值）
   base_gains:
     # 比例增益 P: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
-    p: [1500.0, 1500.0, 800.0, 300.0, 300.0, 100.0]  # DDPG成功案例的值
+    p: [2000.0, 1500.0, 1200.0, 300.0, 300.0, 200.0]  # DDPG成功案例的值
     # 微分增益 D: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
-    d: [180.0, 180.0, 110.0, 50.0, 50.0, 50.0]        # 统一的阻尼系数
+    d: [80.0, 50.0, 40.0, 15.0, 15.0, 10.0]        # 统一的阻尼系数
     # 积分增益 I: [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
     i: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]                   # 暂时不用积分项
 

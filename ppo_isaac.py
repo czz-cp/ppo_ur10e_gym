@@ -25,11 +25,17 @@ from utils import (ValueNormalization, GAE, assert_same_device, check_tensor_dev
 class ActorNetwork(nn.Module):
     """Actor网络 - PPO策略函数"""
 
-    def __init__(self, state_dim: int = 18, action_dim: int = 3, hidden_dim: int = 64):
+    def __init__(self, state_dim: int = 18, action_dim: int = 6, hidden_dim: int = 64):
         super().__init__()
 
         self.state_dim = state_dim
         self.action_dim = action_dim
+
+        self.max_torques = np.array([264.0, 264.0, 120.0, 43.2, 43.2, 43.2], dtype=np.float32)
+        self.action_space_high = self.max_torques
+        self.action_space_low = -self.max_torques
+
+        self.register_buffer("max_torques_tensor", torch.tensor(self.max_torques, dtype=torch.float32)) 
 
         # 策略网络
         self.policy_net = nn.Sequential(
@@ -44,17 +50,12 @@ class ActorNetwork(nn.Module):
         self._init_actor_weights()
 
     def _init_actor_weights(self):
-        """专门为Actor网络设计的初始化，确保输出动作在合理范围内"""
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear):
-                if 'policy_net.5' in name:  # 输出层
-                    # 输出层：均值为1.05（动作范围中点），权重较小
-                    nn.init.constant_(module.weight.data, 0.01)
-                    nn.init.constant_(module.bias.data, 1.05)  # (0.1 + 2.0) / 2
-                else:
-                    # 隐藏层：标准初始化
-                    nn.init.orthogonal_(module.weight.data, gain=np.sqrt(2))
-                    nn.init.constant_(module.bias.data, 0)
+        """标准的 Orthogonal 初始化 + 零偏置，不再给输出层加 1.05 偏置"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.constant_(m.bias, 0.0)
+
 
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -67,9 +68,15 @@ class ActorNetwork(nn.Module):
             mean: [batch_size, action_dim] 动作均值
             std: [batch_size, action_dim] 动作标准差
         """
+        #self.max_torques_tensor = torch.tensor(self.max_torques, device=self.device, dtype=torch.float32)
+
         policy_output = self.policy_net(state)
         mean, log_std = policy_output.chunk(2, dim=-1)
-        std = F.softplus(log_std) + 1e-5  # 确保标准差为正
+
+        log_std = torch.clamp(log_std, -2.0, 2.0)
+        #std = F.softplus(log_std)   # 确保标准差为正
+        #softplus(x) = log(1 + exp(x))
+        std = torch.exp(log_std) 
         return mean, std
 
     def sample(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -85,12 +92,16 @@ class ActorNetwork(nn.Module):
         """
         mean, std = self.forward(state)
         dist = Normal(mean, std)
-        action = dist.sample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
 
-        max_tau = 30.0
-        action = torch.clamp(action, -max_tau, max_tau)
-        #action = torch.clamp(action, 0.1, 2.0)
+        #action = dist.sample() 
+        raw = dist.rsample()  # 用 rsample 方便以后做 reparameterization
+        log_prob = dist.log_prob(raw).sum(dim=-1)
+
+        action = torch.tanh(raw)  # 将动作限制在[-1, 1]范围内
+        action = action * self.max_torques_tensor
+
+        #max_tau = 30.0PPOIsaac.collect_rollouts
+        #action = torch.clamp(action, -max_tau, max_tau)
 
         return action, log_prob
 
@@ -439,8 +450,8 @@ class PPOIsaac:
         advantages, returns = self.gae(rewards, dones, values, next_values_expanded)
 
         # 展平
-        advantages = advantages.view(-1)  # [T*N]
-        returns = returns.view(-1)  # [T*N]
+        advantages = advantages.view(-1).float()  # [T*N]
+        returns = returns.view(-1).float()  # [T*N]
 
         # 归一化优势
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -468,12 +479,36 @@ class PPOIsaac:
                 batch_returns = returns[batch_indices]
 
                 # 计算新的动作概率 (需要梯度进行更新)
-                new_means, new_stds = self.actor(batch_states)
-                dist = Normal(new_means, new_stds)
-                batch_new_log_probs = dist.log_prob(batch_actions).sum(dim=-1)
+                #new_means, new_stds = self.actor(batch_states)
+                #ist = Normal(new_means, new_stds)
+                #batch_new_log_probs = dist.log_prob(batch_actions).sum(dim=-1)
 
                 # 计算比率
+                #ratio = torch.exp(batch_new_log_probs - batch_old_log_probs)
+
+                # 1. 得到高斯参数（raw 空间）
+                new_means, new_stds = self.actor(batch_states)   # [B, act_dim]
+                dist = Normal(new_means, new_stds)
+
+                # 2. 把扭矩动作还原回 raw 空间
+                #   2.1 先除以 max_torques 得到 squashed ∈ [-1,1]
+                max_torques = self.actor.max_torques_tensor      # [6]
+                squashed = batch_actions / max_torques           # [B,6]，自动 broadcast
+
+                #   2.2 数值安全一点，夹紧在 (-1+eps, 1-eps)
+                eps = 1e-6
+                squashed = torch.clamp(squashed, -1.0 + eps, 1.0 - eps)
+
+                #   2.3 反 tanh：raw = atanh(squashed)
+                raw = 0.5 * (torch.log1p(squashed) - torch.log1p(-squashed))
+                # 也可以用 torch.atanh(squashed)（如果你的 torch 版本支持）
+
+                # 3. 在 raw 空间下算 log_prob
+                batch_new_log_probs = dist.log_prob(raw).sum(dim=-1)
+
+                # 4. 一切照旧
                 ratio = torch.exp(batch_new_log_probs - batch_old_log_probs)
+
 
                 # Actor损失 (PPO裁剪)
                 surr1 = ratio * batch_advantages
@@ -484,8 +519,8 @@ class PPOIsaac:
                 entropy = dist.entropy().sum(dim=-1).mean()
 
                 # Critic损失
-                batch_values = self.critic(batch_states).squeeze(-1)
-                normalized_returns = self.value_norm.normalize(batch_returns)
+                batch_values = self.critic(batch_states).squeeze(-1).float()
+                normalized_returns = self.value_norm.normalize(batch_returns).float()
                 critic_loss = F.mse_loss(batch_values, normalized_returns.detach())
 
                 # 总损失

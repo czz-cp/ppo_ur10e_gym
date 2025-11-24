@@ -151,9 +151,10 @@ class UR10ePPOEnvIsaac:
             print(f"  {i+1}. {name:12}: [{limits[0]:.2f}, {limits[1]:.2f}] rad ({limits_deg[0]:.0f}°, {limits_deg[1]:.0f}°)")
 
         # 动作空间限制 (RL补偿力矩)
-        max_compensation_torque = 30.0  # 30 N⋅m补偿力矩 (约为最大力矩的10%)
-        self.action_space_high = np.array([max_compensation_torque] * 6)  # [τ1, τ2, τ3, τ4, τ5, τ6]
-        self.action_space_low = np.array([-max_compensation_torque] * 6)
+        #max_compensation_torque = 30.0  # 30 N⋅m补偿力矩 (约为最大力矩的10%)
+        #self.action_space_high = np.array([max_compensation_torque] * 6)  # [τ1, τ2, τ3, τ4, τ5, τ6]
+        #self.action_space_low = np.array([-max_compensation_torque] * 6)
+        
 
         # 状态空间 (18维：当前关节角度6 + 目标关节角度6 + 当前末端位置3 + 目标位置3)
         self.state_dim = 18
@@ -906,17 +907,31 @@ class UR10ePPOEnvIsaac:
 
         避免复杂的逆运动学计算，确保目标位置是可达的
         """
+        
         target_joint_angles = torch.zeros((self.num_envs, 6), device=self.device)
 
         # 在工作空间内随机生成关节角度
         for i in range(6):
             low, high = self.joint_limits[i]
             # 使用较小的范围确保在工作空间内
-            safe_low = low * 0.5
-            safe_high = high * 0.5
+            safe_low = low * 0.3
+            safe_high = high * 0.3
             target_joint_angles[:, i] = torch.rand(self.num_envs, device=self.device) * (safe_high - safe_low) + safe_low
 
-        return target_joint_angles
+        noise = torch.empty((self.num_envs, 6), device=self.device)
+
+        # 前三关节：±0.5rad（≈±30°）
+        noise[:, :3].uniform_(-0.5, 0.5)
+        # 手腕：±0.8rad（≈±45°）
+        noise[:, 3:].uniform_(-0.8, 0.8)
+
+        target = self.start_joint_angles + noise
+
+        low = torch.tensor(self.joint_limits[:, 0], device=self.device)
+        high = torch.tensor(self.joint_limits[:, 1], device=self.device)
+        target = torch.max(torch.min(target, high), low)
+
+        return target
 
     def _compute_positions_from_joint_angles(self, joint_angles: torch.Tensor) -> torch.Tensor:
         """
@@ -1089,7 +1104,9 @@ class UR10ePPOEnvIsaac:
         rl_compensation = actions  # [num_envs, 6]
 
         # ⚡ 总力矩 = PID力矩 + RL补偿
-        total_torques = pid_torques + rl_compensation
+        #total_torques = pid_torques + rl_compensation
+        # ⚡ 总力矩 = RL补偿
+        total_torques = rl_compensation
 
         # 🔒 力矩限制（确保安全）
         for j in range(6):
@@ -1160,7 +1177,7 @@ class UR10ePPOEnvIsaac:
         velocity_rewards = -torch.sum(self.Q_velocity_weights.unsqueeze(0) * velocity_errors**2, dim=1)  # [num_envs]
 
         # 总奖励 = 位置奖励 + 速度奖励
-        total_rewards = position_rewards + velocity_rewards
+        total_rewards = position_rewards+velocity_rewards
         total_rewards = self.reward_scale*total_rewards
 
         # 📊 调试信息（每100步打印一次）
@@ -1171,10 +1188,10 @@ class UR10ePPOEnvIsaac:
 
             print(f"📈 步骤{self.debug_step}:")
             print(f"   平均关节位置误差: {avg_position_error:.4f} rad ({avg_position_error*180/3.14159:.1f}°)")
-            print(f"   平均关节速度误差: {avg_velocity_error:.4f} rad/s")
+            #print(f"   平均关节速度误差: {avg_velocity_error:.4f} rad/s")
             print(f"   平均奖励: {avg_reward:.2f}")
             print(f"   位置奖励分量: {position_rewards.mean().item():.2f}")
-            print(f"   速度奖励分量: {velocity_rewards.mean().item():.2f}")
+            #print(f"   速度奖励分量: {velocity_rewards.mean().item():.2f}")
 
         self.debug_step += 1
         return total_rewards

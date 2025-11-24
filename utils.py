@@ -220,14 +220,15 @@ class GAE:
         """
         T, N = rewards.shape
 
-        # 确保所有输入张量在正确的设备上
-        rewards = rewards.to(self.device)
+         # 🔧 1) 统一成 float32
+        rewards = rewards.to(self.device).float()
         dones = dones.to(self.device)
-        values = values.to(self.device)
-        next_values = next_values.to(self.device)
+        values = values.to(self.device).float()
+        next_values = next_values.to(self.device).float()
 
-        advantages = torch.zeros_like(rewards)
-        returns = torch.zeros_like(rewards)
+        # 🔧 2) 明确 advantages / returns 也是 float32
+        advantages = torch.zeros_like(rewards, dtype=torch.float32)
+        returns = torch.zeros_like(rewards, dtype=torch.float32)
 
         # 计算自适应折扣因子
         if self.use_adaptive_gamma and action_probs is not None:
