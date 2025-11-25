@@ -864,8 +864,8 @@ class UR10ePPOEnvIsaac:
 
         return obs, rewards, dones, info
 
-    def _sample_random_joint_angles_batch(self) -> torch.Tensor:
-        """批量采样随机关节角度"""
+    """def _sample_random_joint_angles_batch(self) -> torch.Tensor:
+        批量采样随机关节角度
         angles = torch.zeros((self.num_envs, 6), device=self.device)
 
         for i in range(6):
@@ -874,56 +874,49 @@ class UR10ePPOEnvIsaac:
                 self.num_envs, device=self.device
             ) * (high - low) * 0.5 + low * 0.5  # 使用较小的范围
 
+        return angles"""
+    
+    def _sample_random_joint_angles_batch(self) -> torch.Tensor:
+        """批量采样“可动”的随机关节角度（远离极限和奇异位）"""
+        # joint_limits: 形状 [6, 2]，每行 [low, high]
+        joint_limits = torch.tensor(self.joint_limits, device=self.device, dtype=torch.float32)  # [6,2]
+        low = joint_limits[:, 0]   # [6]
+        high = joint_limits[:, 1]  # [6]
+
+        center = (low + high) / 2.0          # 中点
+        half_range = (high - low) / 2.0      # 半范围
+
+        # 只用中间 40% 的范围，避免靠近极限
+        ratio = 0.4
+        noise_range = half_range * ratio     # 每个关节的“活动半径”
+
+        # 随机在 [-noise_range, +noise_range] 内扰动
+        # angles 形状 [num_envs, 6]
+        noise = (torch.rand(self.num_envs, 6, device=self.device) * 2.0 - 1.0) * noise_range  # [-1,1]*noise_range
+        angles = center.unsqueeze(0) + noise  # [1,6] + [num_envs,6] -> [num_envs,6]
+
+        # 再保险一点，离上下限各留 10% 的 margin
+        margin = 0.1 * (high - low)
+        safe_low = low + margin
+        safe_high = high - margin
+
+        angles = torch.max(torch.min(angles, safe_high.unsqueeze(0)), safe_low.unsqueeze(0))
         return angles
 
-    def _sample_random_target_positions_batch(self) -> torch.Tensor:
-        """
-        🎯 批量采样随机目标位置（基于config配置）
 
-        从config中读取目标位置范围，便于调整UR10e工作空间
-        """
-        # 从config中读取目标位置范围
-        target_range = self.config['env']['target_range']
-        x_range = target_range['x']
-        y_range = target_range['y']
-        z_range = target_range['z']
-
-        target_positions = torch.zeros((self.num_envs, 3), device=self.device)
-
-        # 在指定范围内随机生成目标位置
-        target_positions[:, 0] = torch.rand(self.num_envs, device=self.device) * (x_range[1] - x_range[0]) + x_range[0]
-        target_positions[:, 1] = torch.rand(self.num_envs, device=self.device) * (y_range[1] - y_range[0]) + y_range[0]
-        target_positions[:, 2] = torch.rand(self.num_envs, device=self.device) * (z_range[1] - z_range[0]) + z_range[0]
-
-        # 调试信息：打印第一个环境的目标位置
-        if hasattr(self, 'debug_step') and self.debug_step % 500 == 0:  # 每500步打印一次
-            print(f"🎯 目标位置更新: [{target_positions[0].cpu().numpy().tolist()}]")
-
-        return target_positions
-
+    
     def _sample_target_joint_angles_batch(self) -> torch.Tensor:
         """
-        🎯 直接采样随机的目标关节角度，然后用正运动学生成目标位置
-
-        避免复杂的逆运动学计算，确保目标位置是可达的
+        目标关节角：在起始角的基础上再加一个小偏移
         """
-        
-        target_joint_angles = torch.zeros((self.num_envs, 6), device=self.device)
-
-        # 在工作空间内随机生成关节角度
-        for i in range(6):
-            low, high = self.joint_limits[i]
-            # 使用较小的范围确保在工作空间内
-            safe_low = low * 0.3
-            safe_high = high * 0.3
-            target_joint_angles[:, i] = torch.rand(self.num_envs, device=self.device) * (safe_high - safe_low) + safe_low
+        # 确保 start_joint_angles 已经填好
+        if not hasattr(self, "start_joint_angles"):
+            self.start_joint_angles = self._sample_random_joint_angles_batch()
 
         noise = torch.empty((self.num_envs, 6), device=self.device)
-
-        # 前三关节：±0.5rad（≈±30°）
-        noise[:, :3].uniform_(-0.5, 0.5)
-        # 手腕：±0.8rad（≈±45°）
-        noise[:, 3:].uniform_(-0.8, 0.8)
+        # 相对起始角的偏移，前 3 关节 ±0.5rad，手腕 ±0.8rad
+        noise[:, :3].uniform_(-0.5, 0.5)   # ≈ ±30°
+        noise[:, 3:].uniform_(-0.8, 0.8)   # ≈ ±45°
 
         target = self.start_joint_angles + noise
 
@@ -932,6 +925,7 @@ class UR10ePPOEnvIsaac:
         target = torch.max(torch.min(target, high), low)
 
         return target
+
 
     def _compute_positions_from_joint_angles(self, joint_angles: torch.Tensor) -> torch.Tensor:
         """
@@ -1177,7 +1171,7 @@ class UR10ePPOEnvIsaac:
         velocity_rewards = -torch.sum(self.Q_velocity_weights.unsqueeze(0) * velocity_errors**2, dim=1)  # [num_envs]
 
         # 总奖励 = 位置奖励 + 速度奖励
-        total_rewards = position_rewards+velocity_rewards
+        total_rewards = position_rewards
         total_rewards = self.reward_scale*total_rewards
 
         # 📊 调试信息（每100步打印一次）

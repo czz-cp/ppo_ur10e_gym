@@ -41,7 +41,7 @@ visualization:
 ppo:
   # 学习率（降低以稳定训练）
   lr_actor: 1e-4                 # 降低Actor学习率，更稳定学习
-  lr_critic: 5e-4                # 降低Critic学习率
+  lr_critic: 1e-4                # 降低Critic学习率
 
   # PPO核心参数（保守设置）
   clip_eps: 0.15                 # 降低裁剪参数，更保守更新
@@ -49,7 +49,7 @@ ppo:
   lam: 0.95                      # GAE λ参数保持不变
 
   # 正则化（增加探索）
-  entropy_coef: 0.02             # 增加熵系数，鼓励更多探索
+  entropy_coef: 0.01             # 增加熵系数，鼓励更多探索
   value_coef: 0.5                # 价值函数系数保持不变
 
   # 梯度处理
@@ -58,7 +58,7 @@ ppo:
 # 训���配置（优化rollout策略）
 train:
   rollout_length: 512           # 降低rollout长度，更适合500步episode
-  batch_size: 32                 # 批次大小
+  batch_size: 64                 # 批次大小
   num_updates: 10                # 每次收集后更新次数
   num_episodes: 10000            # 总训练回合数
 
