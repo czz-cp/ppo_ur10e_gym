@@ -40,8 +40,8 @@ visualization:
 # PPO算法配置（优化超参数）
 ppo:
   # 学习率（降低以稳定训练）
-  lr_actor: 1e-4                 # 降低Actor学习率，更稳定学习
-  lr_critic: 1e-4                # 降低Critic学习率
+  lr_actor: 5e-4                 # 降低Actor学习率，更稳定学习
+  lr_critic: 5e-4                # 降低Critic学习率
 
   # PPO核心参数（保守设置）
   clip_eps: 0.15                 # 降低裁剪参数，更保守更新

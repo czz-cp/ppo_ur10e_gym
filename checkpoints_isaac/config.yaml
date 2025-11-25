@@ -64,8 +64,8 @@ ppo:
   entropy_coef: 0.01
   gamma: 0.995
   lam: 0.95
-  lr_actor: 1e-4
-  lr_critic: 1e-4
+  lr_actor: 5e-4
+  lr_critic: 5e-4
   max_grad_norm: 0.5
   value_coef: 0.5
 reward:

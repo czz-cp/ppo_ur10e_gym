@@ -87,7 +87,7 @@ class UR10ePPOEnvIsaac:
         self.num_envs = num_envs
 
         # 目标：把单步奖励控制在 [-50, 0] 左右
-        self.reward_scale = 1e-5  # 你可以后面微调，比如 5e-4, 2e-3 之类
+        self.reward_scale = 1e-3  # 你可以后面微调，比如 5e-4, 2e-3 之类
 
         # 🎯 优先使用传入的device_id，覆盖配置文件中的设置（多GPU服务器兼容）
         self.device_id = device_id
@@ -1152,7 +1152,7 @@ class UR10ePPOEnvIsaac:
             print(f"   力矩张量类型: {all_dof_forces.dtype}")
             print(f"   力矩范数: {torch.norm(all_dof_forces)}")
     
-    def _compute_rewards_batch(self, actions):
+    def _compute_rewards_batch_(self, actions):
         """
         🎯 二次型奖励函数（基于论文设计）
 
@@ -1189,6 +1189,68 @@ class UR10ePPOEnvIsaac:
 
         self.debug_step += 1
         return total_rewards
+    
+    def _compute_rewards_batch(self, actions):
+        """
+        改进版奖励函数：
+        - 关节误差 + 末端误差 的二次型惩罚
+        - 速度 / 力矩惩罚
+        - 朝目标靠拢的进步奖励
+        - 成功 bonus
+        """
+
+        # 1. 当前关节 / 速度 / 末端位姿
+        current_angles, current_vels = self._get_joint_angles_and_velocities()
+        current_positions = self._compute_end_effector_positions_batch(current_angles)
+
+        # 2. 误差（关节 + 末端）
+        joint_errors = self.target_joint_angles - current_angles     # [N,6]
+        pos_errors   = self.target_positions  - current_positions    # [N,3]
+
+        joint_norm = torch.norm(joint_errors, dim=1)   # [N]
+        pos_norm   = torch.norm(pos_errors,   dim=1)   # [N]
+
+        # ==== 权重（建议先写死在这里，感觉好了再挪回 __init__）====
+        w_joint = 5.0      # 关节误差权重
+        w_pos   = 50.0     # 末端位置误差权重
+        w_vel   = 0.01     # 关节速度惩罚
+        w_tau   = 0.001    # 力矩惩罚
+        w_prog  = 5.0      # 进步奖励（上一步距离 - 这一步距离）
+        success_bonus = 20.0
+
+        # 3. 基础二次型惩罚
+        joint_cost = joint_norm ** 2              # [N]
+        pos_cost   = pos_norm ** 2                # [N]
+        vel_cost   = torch.sum(current_vels**2, dim=1)
+        tau_cost   = torch.sum(actions**2,      dim=1)
+
+        reward = (
+            - w_joint * joint_cost
+            - w_pos   * pos_cost
+            #- w_vel   * vel_cost
+            - w_tau   * tau_cost
+        )
+
+        # 4. 朝目标靠近的进步奖励（位置为主）
+        # 上一时刻的 pos_norm 存在 self.prev_pos_norm 里
+        """if not hasattr(self, "prev_pos_norm") or self.prev_pos_norm is None:
+            self.prev_pos_norm = pos_norm.detach()
+        else:
+            dist_diff = (self.prev_pos_norm - pos_norm)   # >0 说明在变近
+            reward = reward + w_prog * dist_diff
+            self.prev_pos_norm = pos_norm.detach()"""
+
+        # 5. 成功 bonus：同时满足关节 + 位置精度
+        joint_success = joint_norm < 0.052   # ~3°
+        pos_success   = pos_norm   < 0.05    # 5cm
+        success = joint_success & pos_success
+        reward = reward + success.float() * success_bonus
+
+        reward = self.reward_scale*reward
+
+        # 6. 可选：把 reward 控制在大致 [-100, +20] 级别就行
+        #    你可以不再乘 self.reward_scale，或者设成 1.0
+        return reward
 
 
     def _check_done_batch(self) -> torch.Tensor:
