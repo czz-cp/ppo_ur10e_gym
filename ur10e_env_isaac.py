@@ -687,6 +687,10 @@ class UR10ePPOEnvIsaac:
         self.prev_position_errors = torch.ones(self.num_envs, device=self.device) * 10.0
         self.prev_joint_errors = torch.ones(self.num_envs, device=self.device) * 10.0  # 🎯 重置关节误差
 
+        # 初始化期望关节角度（用于速度控制）
+        self.desired_joint_angles = self.start_joint_angles.clone()
+        print(f"🔧 Reset: 初始化��望关节角度为起始角度")
+
         # 🎯 重置稳定性跟踪
         self.on_goal_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
@@ -796,8 +800,8 @@ class UR10ePPOEnvIsaac:
 
         self.actions_buf = actions
 
-        # 执行RL-PID控制
-        self._apply_rl_pid_control(actions)
+        # 执行速度PD控制
+        self._apply_velocity_pd_control(actions)
 
         # 推进一步
         self.gym.simulate(self.sim)
@@ -886,14 +890,22 @@ class UR10ePPOEnvIsaac:
         center = (low + high) / 2.0          # 中点
         half_range = (high - low) / 2.0      # 半范围
 
-        # 只用中间 40% 的范围，避免靠近极限
-        ratio = 0.4
-        noise_range = half_range * ratio     # 每个关节的“活动半径”
+        # 只用中间 20% 的范围，确保TCP位置在工作空间内
+        ratio = 0.2
+        noise_range = half_range * ratio     # 每个关节的"活动半径"
 
         # 随机在 [-noise_range, +noise_range] 内扰动
         # angles 形状 [num_envs, 6]
         noise = (torch.rand(self.num_envs, 6, device=self.device) * 2.0 - 1.0) * noise_range  # [-1,1]*noise_range
         angles = center.unsqueeze(0) + noise  # [1,6] + [num_envs,6] -> [num_envs,6]
+
+        # 进一步限制前三个关节的角度范围，确保TCP在工作空间内
+        # shoulder_pan: 限制在±1.0 rad (±57°)
+        angles[:, 0] = torch.clamp(angles[:, 0], -1.0, 1.0)
+        # shoulder_lift: 限制在[0.8, 2.0] rad (确保TCP有足够高度，手臂向上)
+        angles[:, 1] = torch.clamp(angles[:, 1], 0.8, 2.0)
+        # elbow: 限制在[-0.5, 0.5] rad (适中的肘部角度)
+        angles[:, 2] = torch.clamp(angles[:, 2], -0.5, 0.5)
 
         # 再保险一点，离上下限各留 10% 的 margin
         margin = 0.1 * (high - low)
@@ -1069,8 +1081,129 @@ class UR10ePPOEnvIsaac:
         ee_pos = T_cum[:3, 3]
         return ee_pos
 
+    def _apply_velocity_pd_control(self, normalized_velocities: torch.Tensor):
+        """
+        应用基于速度的PD控制：
+        1. 将归一化速度[-1,1]转换为物理速度
+        2. 积分得到期望关节角度
+        3. 应用PD控制生成力矩
+        4. 强制执行力矩限制
+        """
+        # 确保输入是2D tensor: [num_envs, 6]
+        if normalized_velocities.ndim == 1:
+            normalized_velocities = normalized_velocities.unsqueeze(0)  # [6] -> [1, 6]
+
+        # 验证动作维度
+        if normalized_velocities.shape[-1] != 6:
+            raise ValueError(f"期望6维归一化速度，得到{normalized_velocities.shape[-1]}维")
+
+        # 检查归一化速度是否在范围内
+        if not torch.all((normalized_velocities >= -1.0) & (normalized_velocities <= 1.0)):
+            print(f"⚠️ 归一化速度超出[-1,1]范围: min={normalized_velocities.min().item():.3f}, max={normalized_velocities.max().item():.3f}")
+            normalized_velocities = torch.clamp(normalized_velocities, -1.0, 1.0)
+
+        # 获取当前状态
+        current_angles, current_velocities = self._get_joint_angles_and_velocities()
+
+        # 初始化期望关节角度（第一次调用时）
+        if not hasattr(self, 'desired_joint_angles') or self.desired_joint_angles is None:
+            self.desired_joint_angles = current_angles.clone()
+            print(f"🔧 初始化期望关节角度: {self.desired_joint_angles[0].detach().cpu().numpy()}")
+
+        # 1. 速度反归一化：[-1,1] -> 物理速度范围
+        if not hasattr(self, 'velocity_limits_tensor'):
+            # 如果没有在子类中定义，使用默认值
+            self.velocity_limits_tensor = torch.tensor([2.094, 2.094, 3.142, 3.142, 3.142, 3.142], device=self.device)
+
+        physical_velocities = normalized_velocities * self.velocity_limits_tensor  # [num_envs, 6]
+
+        # 2. 积分得到期望关节角度 q_des(t+1) = clamp(q_des(t) + q̇_cmd * dt, joint_limits)
+        dt = self.config['env']['dt']  # 0.01s
+        self.desired_joint_angles = self.desired_joint_angles + physical_velocities * dt
+
+        # 关节限制（如果存在）
+        if hasattr(self, 'joint_lower_limits_tensor') and hasattr(self, 'joint_upper_limits_tensor'):
+            self.desired_joint_angles = torch.clamp(
+                self.desired_joint_angles,
+                self.joint_lower_limits_tensor,
+                self.joint_upper_limits_tensor
+            )
+
+        # 3. PD控制律：τ = Kp * (q_des - q) + Kd * (-qdot)
+        # 从config获取PD增益，如果没有则使用默认值
+        if 'pid_params' in self.config and 'base_gains' in self.config['pid_params']:
+            kp_gains = self.config['pid_params']['base_gains']['p']
+            kd_gains = self.config['pid_params']['base_gains']['d']
+        else:
+            # 默认PD增益（针对速度控制优化）
+            kp_gains = [1000.0, 1000.0, 800.0, 400.0, 200.0, 100.0]
+            kd_gains = [50.0, 50.0, 30.0, 20.0, 10.0, 5.0]
+
+        kp_tensor = torch.tensor(kp_gains, device=self.device)
+        kd_tensor = torch.tensor(kd_gains, device=self.device)
+
+        # 计算PD力矩
+        position_errors = self.desired_joint_angles - current_angles  # [num_envs, 6]
+        pd_torques = kp_tensor * position_errors - kd_tensor * current_velocities  # [num_envs, 6]
+
+        # 4. 力矩限制（UR10e规格）
+        ur10e_torque_limits = [330.0, 330.0, 150.0, 54.0, 54.0, 54.0]
+        ur10e_torque_limits_tensor = torch.tensor(ur10e_torque_limits, device=self.device)
+
+        total_torques = torch.clamp(
+            pd_torques,
+            -ur10e_torque_limits_tensor,
+            ur10e_torque_limits_tensor
+        )
+
+        # 5. 转换到Isaac Gym格式并应用
+        # Isaac Gym期望CPU张量 [num_envs, 6, 1]
+        all_dof_forces = torch.zeros(self.num_envs, 6, 1, device='cpu')
+        for i in range(self.num_envs):
+            for j in range(6):
+                all_dof_forces[i, j, 0] = total_torques[i, j].detach().cpu()
+
+        # 应用到仿真
+        try:
+            if all_dof_forces.device.type != 'cpu':
+                all_dof_forces_cpu = all_dof_forces.cpu()
+            else:
+                all_dof_forces_cpu = all_dof_forces
+            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(all_dof_forces_cpu))
+        except Exception as e:
+            print(f"❌ Isaac Gym力矩设置失败: {e}")
+            print(f"   力矩张量形状: {all_dof_forces.shape}")
+            print(f"   力矩张量设备: {all_dof_forces.device}")
+
+        # 调试信息
+        if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
+            print(f"\n🎯 === 步骤 {self.debug_step} 速度PD控制调试信息 ===")
+            i = 0  # 显示第一个环境
+            print(f"🤖 环境{i}:")
+            print(f"   归一化速度: [{normalized_velocities[i].detach().cpu().numpy()}]")
+            print(f"   物理速度:   [{physical_velocities[i].detach().cpu().numpy()}] rad/s")
+            print(f"   当前角度:   [{current_angles[i].detach().cpu().numpy()}] rad")
+            print(f"   期望角度:   [{self.desired_joint_angles[i].detach().cpu().numpy()}] rad")
+            print(f"   位置误差:   [{position_errors[i].detach().cpu().numpy()}] rad")
+            print(f"   PD力矩:     [{pd_torques[i].detach().cpu().numpy()}] N⋅m")
+            print(f"   限制后力矩: [{total_torques[i].detach().cpu().numpy()}] N⋅m")
+
+            joint_names = ['shoulder_pan', 'shoulder_lift', 'elbow_joint', 'wrist_1', 'wrist_2', 'wrist_3']
+            for j, (name, total, limit) in enumerate(zip(joint_names, total_torques[i].detach().cpu().numpy(), ur10e_torque_limits)):
+                saturation = abs(total) / limit * 100
+                print(f"      {j+1}. {name:12}: {total:7.2f} N⋅m (限制: ±{limit:5.1f}, 饱和度: {saturation:5.1f}%)")
+
     def _apply_rl_pid_control(self, actions: torch.Tensor):
-        """应用RL补偿力矩控制：基础PID力矩 + RL补偿力矩"""
+        """
+        兼容性方法：调用新的速度PD控制
+        保持向后兼容，如果调用旧方法则重定向到新方法
+        """
+        print("⚠️ _apply_rl_pid_control 已弃用，使用 _apply_velocity_pd_control")
+        self._apply_velocity_pd_control(actions)
+        # 确保actions是2D tensor: [num_envs, 6]
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(0)  # [6] -> [1, 6]
+
         # 验证动作维度 (现在应该是6维)
         if actions.shape[-1] != 6:
             raise ValueError(f"期望6维力矩补偿动作，得到{actions.shape[-1]}维")
@@ -1198,6 +1331,9 @@ class UR10ePPOEnvIsaac:
         - 朝目标靠拢的进步奖励
         - 成功 bonus
         """
+        # 确保actions是2D tensor
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(0)  # [6] -> [1, 6]
 
         # 1. 当前关节 / 速度 / 末端位姿
         current_angles, current_vels = self._get_joint_angles_and_velocities()

@@ -2,15 +2,9 @@
 PPO (Proximal Policy Optimization) Implementation - Isaac Gym版本
 
 针对Isaac Gym优化的PPO实现，支持大规模并行训练
-集成RL-PID混合控制和奖励归一化功能
 """
 
 # IMPORTANT: Isaac Gym must be imported before PyTorch
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.distributions import Normal
 import numpy as np
 import gym
 from typing import Dict, Any, List, Tuple, Optional
@@ -18,24 +12,29 @@ import time
 import os
 
 from ur10e_env_isaac import UR10ePPOEnvIsaac
+from ur10e_trajectory_env_isaac import UR10eTrajectoryEnvIsaac
 from utils import (ValueNormalization, GAE, assert_same_device, check_tensor_devices,
                    get_tensor_device, ensure_device, get_forced_device)
-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Normal
 
 class ActorNetwork(nn.Module):
     """Actor网络 - PPO策略函数"""
 
-    def __init__(self, state_dim: int = 18, action_dim: int = 6, hidden_dim: int = 64):
+    def __init__(self, state_dim: int = 19, action_dim: int = 6, hidden_dim: int = 64):
         super().__init__()
 
         self.state_dim = state_dim
         self.action_dim = action_dim
 
-        self.max_torques = np.array([264.0, 264.0, 120.0, 43.2, 43.2, 43.2], dtype=np.float32)
-        self.action_space_high = self.max_torques
-        self.action_space_low = -self.max_torques
+        # Updated for normalized velocity control
+        self.action_space_high = torch.tensor([1.0] * action_dim, dtype=torch.float32)
+        self.action_space_low = torch.tensor([-1.0] * action_dim, dtype=torch.float32)
 
-        self.register_buffer("max_torques_tensor", torch.tensor(self.max_torques, dtype=torch.float32)) 
+        self.register_buffer("action_limits_tensor", torch.tensor([1.0] * action_dim, dtype=torch.float32)) 
 
         # 策略网络
         self.policy_net = nn.Sequential(
@@ -98,17 +97,16 @@ class ActorNetwork(nn.Module):
         log_prob = dist.log_prob(raw).sum(dim=-1)
 
         action = torch.tanh(raw)  # 将动作限制在[-1, 1]范围内
-        action = action * self.max_torques_tensor
-
-        #max_tau = 30.0PPOIsaac.collect_rollouts
-        #action = torch.clamp(action, -max_tau, max_tau)
+        # For normalized velocity control, action is already in [-1, 1] range
+        # No need to scale to torque limits
+        # action = action * self.action_limits_tensor  # This would just be identity
 
         return action, log_prob
 
 class CriticNetwork(nn.Module):
     """Critic网络 - PPO价值函数"""
 
-    def __init__(self, state_dim: int = 18, hidden_dim: int = 64):
+    def __init__(self, state_dim: int = 19, hidden_dim: int = 64):
         super().__init__()
 
         # 价值网络
@@ -149,7 +147,7 @@ class PPOIsaac:
     """
 
     def __init__(self,
-                 env: UR10ePPOEnvIsaac,
+                 env: UR10eTrajectoryEnvIsaac,
                  config: Dict[str, Any]):
         """
         初始化PPO训练器
@@ -301,7 +299,15 @@ class PPOIsaac:
             rollouts: 收集的数据字典
         """
         # 重置环境
-        states = self.env.reset()
+        reset_result = self.env.reset()
+        # Handle both single obs and (obs, info) return formats
+        if isinstance(reset_result, tuple):
+            states, info = reset_result
+            # Store info for potential debugging (suppress unused warning)
+            _ = info
+        else:
+            states = reset_result
+
         # 确保状态在正确的设备上
         states = ensure_device(states, self.device)
 
@@ -320,6 +326,9 @@ class PPOIsaac:
         episode_lengths = np.zeros(self.num_envs)
 
         for step in range(self.rollout_length):
+            # 确保states是2D张量 [num_envs, state_dim]
+            if states.ndim == 1:
+                states = states.unsqueeze(0)  # [state_dim] -> [1, state_dim]
             # 记录当前状态
             rollouts['states'].append(states.clone())
 
@@ -335,13 +344,48 @@ class PPOIsaac:
                 max_episode_steps = self.env.episode_steps.max().item()
                 print(f"📈 Step {step:3d}: 平均episode步数: {avg_episode_steps:.1f}, 最大: {max_episode_steps}")
 
-            # 执行动作
-            next_states, rewards, dones, infos = self.env.step(actions)
+            # 执行动作 (Gymnasium格式返回5个值)
+            step_result = self.env.step(actions)
+            if len(step_result) == 5:
+                # Gymnasium格式: (obs, reward, terminated, truncated, info)
+                next_states, rewards, terminated, truncated, infos = step_result
+                dones = np.logical_or(terminated, truncated)  # 合并terminated和truncated
+            elif len(step_result) == 4:
+                # 旧格式: (obs, reward, done, info)
+                next_states, rewards, dones, infos = step_result
+            else:
+                raise ValueError(f"环境step返回了{len(step_result)}个值，期望4或5个")
 
             # 确保所有张量在正确设备上
             next_states = ensure_device(next_states, self.device)
             rewards = ensure_device(rewards, self.device)
             dones = ensure_device(dones, self.device)
+
+            # 处理numpy数组转换为张量
+            if isinstance(dones, np.ndarray):
+                dones = torch.tensor(dones, dtype=torch.bool, device=self.device)
+            elif not isinstance(dones, torch.Tensor):
+                dones = torch.tensor([dones], dtype=torch.bool, device=self.device)
+
+            # 确保dones是正确的形状
+            if dones.dim() == 0:
+                dones = dones.unsqueeze(0)  # [ ] -> [1]
+            elif dones.dim() > 1:
+                dones = dones.flatten()  # -> [num_envs]
+
+            # 同样处理rewards
+            if isinstance(rewards, (float, int, np.float32, np.float64, np.int32, np.int64)):
+                rewards = torch.tensor([rewards], dtype=torch.float32, device=self.device)
+            elif isinstance(rewards, np.ndarray):
+                rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+            elif not isinstance(rewards, torch.Tensor):
+                rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+
+            # 确保rewards是正确的形状
+            if rewards.dim() == 0:
+                rewards = rewards.unsqueeze(0)  # [ ] -> [1]
+            elif rewards.dim() > 1:
+                rewards = rewards.flatten()  # -> [num_envs]
 
             # 设备一致性检查 (修复设备不匹配问题)
             try:
@@ -375,7 +419,7 @@ class PPOIsaac:
 
             # 处理完成的回合
             for i in range(self.num_envs):
-                if dones[i]:
+                if i < dones.shape[0] and dones[i]:
                     self.episode_count += 1
                     self.total_steps += episode_lengths[i]
 
@@ -490,10 +534,9 @@ class PPOIsaac:
                 new_means, new_stds = self.actor(batch_states)   # [B, act_dim]
                 dist = Normal(new_means, new_stds)
 
-                # 2. 把扭矩动作还原回 raw 空间
-                #   2.1 先除以 max_torques 得到 squashed ∈ [-1,1]
-                max_torques = self.actor.max_torques_tensor      # [6]
-                squashed = batch_actions / max_torques           # [B,6]，自动 broadcast
+                # 2. 把归一化速度动作还原回 raw 空间
+                #   2.1 速度已经是 [-1,1] 范围，直接使用
+                squashed = batch_actions  # [B,6]，已经是 [-1,1] 范���
 
                 #   2.2 数值安全一点，夹紧在 (-1+eps, 1-eps)
                 eps = 1e-6
