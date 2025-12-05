@@ -288,7 +288,7 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
         self.current_ts_waypoints = waypoints
         self.current_waypoint_index[:] = 0
         self.trajectory_completed[:] = False
-        print(f"📍 Set {len(waypoints)} waypoints for trajectory tracking")
+        #print(f"📍 Set {len(waypoints)} waypoints for trajectory tracking")
 
     def get_current_waypoint(self, env_id: int = 0) -> Optional[TSWaypoint]:
         """Get current waypoint for a specific env (default env0 for logging/callback)."""
@@ -458,7 +458,7 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
                     advanced = self.ts_planners[i].update_progress(current_tcp.detach().cpu().numpy())
                     if advanced:
                         self.current_waypoint_index[i] = self.ts_planners[i].current_waypoint_index
-                        print(f"📍 [env {i}] Waypoint {self.current_waypoint_index[i] + 1}/{len(self.current_ts_waypoints)} reached")
+                        #print(f"📍 [env {i}] Waypoint {self.current_waypoint_index[i] + 1}/{len(self.current_ts_waypoints)} reached")
 
                 # 3) Reward per env
                 r_i, wp_reached_i = self._trajectory_reward(current_tcp, action_tensor[i], env_id=i)

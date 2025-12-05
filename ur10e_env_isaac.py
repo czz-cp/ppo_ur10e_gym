@@ -1176,7 +1176,7 @@ class UR10ePPOEnvIsaac:
             print(f"   力矩张量设备: {all_dof_forces.device}")
 
         # 调试信息
-        if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
+        """if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
             print(f"\n🎯 === 步骤 {self.debug_step} 速度PD控制调试信息 ===")
             i = 0  # 显示第一个环境
             print(f"🤖 环境{i}:")
@@ -1191,7 +1191,7 @@ class UR10ePPOEnvIsaac:
             joint_names = ['shoulder_pan', 'shoulder_lift', 'elbow_joint', 'wrist_1', 'wrist_2', 'wrist_3']
             for j, (name, total, limit) in enumerate(zip(joint_names, total_torques[i].detach().cpu().numpy(), ur10e_torque_limits)):
                 saturation = abs(total) / limit * 100
-                print(f"      {j+1}. {name:12}: {total:7.2f} N⋅m (限制: ±{limit:5.1f}, 饱和度: {saturation:5.1f}%)")
+                print(f"      {j+1}. {name:12}: {total:7.2f} N⋅m (限制: ±{limit:5.1f}, 饱和度: {saturation:5.1f}%)")"""
 
     def _apply_rl_pid_control(self, actions: torch.Tensor):
         """
@@ -1423,7 +1423,7 @@ class UR10ePPOEnvIsaac:
         done = stability_done | timeout_done
 
         # 📊 调试信息（每100步打印一次）
-        if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
+        """if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
             joint_success_rate = joint_success.float().mean().item()
             position_success_rate = position_success.float().mean().item()
             combined_success_rate = success_this_step.float().mean().item()
@@ -1435,7 +1435,7 @@ class UR10ePPOEnvIsaac:
             print(f"   位置成功(5cm): {position_success_rate:.2%}")
             print(f"   综合成功: {combined_success_rate:.2%}")
             print(f"   平均稳定性计数: {avg_stability_count:.1f}/{self.stability_required_steps}")
-            print(f"   超时: {timeout_rate:.2%}")
+            print(f"   超时: {timeout_rate:.2%}")"""
 
         return done
 

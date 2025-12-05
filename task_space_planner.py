@@ -200,7 +200,7 @@ class TaskSpacePlannerInterface:
         if self.current_waypoint_index < len(self.current_waypoints) - 1:
             self.current_waypoint_index += 1
             self.stats['waypoints_completed'] += 1
-            print(f"📍 Advanced to waypoint {self.current_waypoint_index + 1}/{len(self.current_waypoints)}")
+            #print(f"📍 Advanced to waypoint {self.current_waypoint_index + 1}/{len(self.current_waypoints)}")
             return True
         else:
             print("🎯 Reached final waypoint - trajectory completed!")
@@ -236,11 +236,12 @@ class TaskSpacePlannerInterface:
         # 添加调试信息
         waypoint_reached = self.check_waypoint_reached(current_tcp)
         if waypoint_reached:
-            print(f"🎯 Waypoint reached! Current TCP: [{current_tcp[0]:.4f}, {current_tcp[1]:.4f}, {current_tcp[2]:.4f}]")
+            #print(f"🎯 Waypoint reached! Current TCP: [{current_tcp[0]:.4f}, {current_tcp[1]:.4f}, {current_tcp[2]:.4f}]")
             waypoint = self.get_current_waypoint()
             if waypoint:
-                print(f"🚩 Target Waypoint: [{waypoint.cartesian_position[0]:.4f}, {waypoint.cartesian_position[1]:.4f}, {waypoint.cartesian_position[2]:.4f}], Tolerance: {waypoint.tolerance:.4f}")
-        
+                #print(f"🚩 Target Waypoint: [{waypoint.cartesian_position[0]:.4f}, {waypoint.cartesian_position[1]:.4f}, {waypoint.cartesian_position[2]:.4f}], Tolerance: {waypoint.tolerance:.4f}")
+                pass
+
         if waypoint_reached:
             return self.advance_to_next_waypoint()
         return False
