@@ -156,8 +156,9 @@ class UR10ePPOEnvIsaac:
         #self.action_space_low = np.array([-max_compensation_torque] * 6)
         
 
-        # 状态空间 (18维：当前关节角度6 + 目标关节角度6 + 当前末端位置3 + 目标位置3)
-        self.state_dim = 18
+        # 状态空间 (22维：紧凑位姿误差表示)
+        # 状态结构：[关节角6 + 当前位姿7 + 目标位姿7 + 位姿误差2]
+        self.state_dim = 22  # 包含紧凑位姿误差表示
         self.action_dim = 6
 
         # 初始化Isaac Gym
@@ -687,6 +688,12 @@ class UR10ePPOEnvIsaac:
         self.prev_position_errors = torch.ones(self.num_envs, device=self.device) * 10.0
         self.prev_joint_errors = torch.ones(self.num_envs, device=self.device) * 10.0  # 🎯 重置关节误差
 
+        # 🎯 重置新的误差跟踪变量（用于增强奖励函数）
+        if hasattr(self, '_prev_position_errors'):
+            delattr(self, '_prev_position_errors')
+        if hasattr(self, 'target_orientations'):
+            delattr(self, 'target_orientations')
+
         # 初始化期望关节角度（用于速度控制）
         self.desired_joint_angles = self.start_joint_angles.clone()
         print(f"🔧 Reset: 初始化��望关节角度为起始角度")
@@ -765,6 +772,14 @@ class UR10ePPOEnvIsaac:
         if self.prev_joint_errors is not None:
             self.prev_joint_errors[done_indices] = 10.0
 
+        # 🎯 重置新的误差跟踪变量（用于增强奖励函数）
+        if hasattr(self, '_prev_position_errors'):
+            self._prev_position_errors[done_indices] = float('inf')
+        if hasattr(self, 'target_orientations'):
+            # 重新采样完成环境的姿态
+            new_orientations = self._sample_random_orientations_batch()[done_indices.cpu().numpy()]
+            self.target_orientations[done_indices] = new_orientations
+
         # 7) 重置对应的奖励归一化器（如果你还在用的话）
         for env_idx in done_indices.cpu().tolist():
             if (0 <= env_idx < len(self.reward_normalizers)
@@ -776,14 +791,7 @@ class UR10ePPOEnvIsaac:
         """
         执行一步仿真
 
-        Args:
-            actions: RL补偿力矩动作 [num_envs, 6] [τ1, τ2, τ3, τ4, τ5, τ6]
-
-        Returns:
-            obs: 下一步状态 [num_envs, state_dim]
-            rewards: 奖励 [num_envs]
-            dones: 完成标志 [num_envs]
-            info: 额外信息
+        
         """
         # 增加调试步数计数器
         self.debug_step += 1
@@ -919,24 +927,115 @@ class UR10ePPOEnvIsaac:
     
     def _sample_target_joint_angles_batch(self) -> torch.Tensor:
         """
-        目标关节角：在起始角的基础上再加一个小偏移
+        目标关节角：从球体-圆柱工作空间中采样可达的关节配置
+
+        方法：
+        1. 随机采样关节角度配置
+        2. 用前向运动学计算末端位置
+        3. 检查位置是否在球体-圆柱工作空间内
+        4. 如果不在，重新采样（拒绝采样）
         """
         # 确保 start_joint_angles 已经填好
         if not hasattr(self, "start_joint_angles"):
             self.start_joint_angles = self._sample_random_joint_angles_batch()
 
-        noise = torch.empty((self.num_envs, 6), device=self.device)
-        # 相对起始角的偏移，前 3 关节 ±0.5rad，手腕 ±0.8rad
-        noise[:, :3].uniform_(-0.5, 0.5)   # ≈ ±30°
-        noise[:, 3:].uniform_(-0.8, 0.8)   # ≈ ±45°
+        target_angles = torch.empty((self.num_envs, 6), device=self.device)
 
-        target = self.start_joint_angles + noise
+        # 工作空间参数
+        sphere_radius = 0.85  # 球体半径
+        cylinder_radius = 0.30  # 圆柱半径
+        max_attempts = 100  # 每个环境的最大采样尝试次数
 
-        low = torch.tensor(self.joint_limits[:, 0], device=self.device)
-        high = torch.tensor(self.joint_limits[:, 1], device=self.device)
-        target = torch.max(torch.min(target, high), low)
+        for i in range(self.num_envs):
+            sampled = False
 
-        return target
+            for attempt in range(max_attempts):
+                # 随机采样关节角度（在关节限制范围内）
+                random_angles = self._sample_random_joint_angles_batch_single()
+
+                # 用前向运动学计算末端位置
+                end_effector_pos = self._compute_end_effector_positions_batch(random_angles.unsqueeze(0))[0]
+
+                # 检查是否在工作空间内
+                if self._is_position_in_workspace(end_effector_pos, sphere_radius, cylinder_radius):
+                    target_angles[i] = random_angles
+                    sampled = True
+                    break
+
+            # 如果采样失败，使用基于起始角的小偏移
+            if not sampled:
+                # 回退到原始方法：在起始角基础上加小偏移
+                noise = torch.empty(6, device=self.device)
+                noise[:3].uniform_(-0.3, 0.3)   # 前三个关节 ±0.3rad
+                noise[3:].uniform_(-0.5, 0.5)   # 手腕关节 ±0.5rad
+
+                fallback_angles = self.start_joint_angles[i] + noise
+
+                # 应用关节限制
+                low = torch.tensor(self.joint_limits[:, 0], device=self.device)
+                high = torch.tensor(self.joint_limits[:, 1], device=self.device)
+                fallback_angles = torch.clamp(fallback_angles, low, high)
+
+                target_angles[i] = fallback_angles
+                if attempt == max_attempts - 1:
+                    print(f"⚠️ 环境 {i} 工作空间采样失败，使用回退方法")
+
+        return target_angles
+
+    def _sample_random_joint_angles_batch_single(self) -> torch.Tensor:
+        """
+        为单个环境采样随机关节角度
+
+        Returns:
+            angles: [6] 关节角度张量
+        """
+        angles = torch.empty(6, device=self.device)
+
+        # 根据UR10e关节限制采样
+        # UR10e关节限制（弧度）：[-2π, 2π], [-2π, 2π], [-π, π], [-2π, 2π], [-2π, 2π], [-2π, 2π]
+        joint_limits = [
+            (-2*np.pi, 2*np.pi),   # Base joint
+            (-2*np.pi, 2*np.pi),   # Shoulder joint
+            (-np.pi, np.pi),       # Elbow joint
+            (-2*np.pi, 2*np.pi),   # Wrist 1 joint
+            (-2*np.pi, 2*np.pi),   # Wrist 2 joint
+            (-2*np.pi, 2*np.pi)    # Wrist 3 joint
+        ]
+
+        for j, (low, high) in enumerate(joint_limits):
+            angles[j] = torch.rand(1, device=self.device).item() * (high - low) + low
+
+        return angles
+
+    def _is_position_in_workspace(self, position: torch.Tensor, sphere_radius: float, cylinder_radius: float) -> bool:
+        """
+        检查位置是否在球体-圆柱工作空间内
+
+        Args:
+            position: [3] 位置张量 [x, y, z]
+            sphere_radius: 球体半径
+            cylinder_radius: 圆柱半径
+
+        Returns:
+            bool: 是否在工作空间内
+        """
+        x, y, z = position[0].item(), position[1].item(), position[2].item()
+
+        # 检查是否在球体内
+        distance_from_origin = np.sqrt(x**2 + y**2 + z**2)
+        if distance_from_origin > sphere_radius:
+            return False
+
+        # 检查是否在圆柱外
+        radial_distance = np.sqrt(x**2 + y**2)
+        if radial_distance <= cylinder_radius:
+            return False
+
+        # 检查z坐标不要太低（避免地面碰撞）
+        if z <= 0.1:  # z > 0.1m
+            return False
+
+        return True
 
 
     def _compute_positions_from_joint_angles(self, joint_angles: torch.Tensor) -> torch.Tensor:
@@ -958,19 +1057,62 @@ class UR10ePPOEnvIsaac:
         # 获取当前关节角度和速度
         current_angles, current_velocities = self._get_joint_angles_and_velocities()
 
-        # 计算末端位置
+        # 计算当前末端位姿（位置 + 姿态）
         current_positions = self._compute_end_effector_positions_batch(current_angles)
+        current_orientations = self._compute_end_effector_orientations_batch(current_angles)
 
-        # 🎯 构建状态向量 (18维：当前关节角度6 + 目标关节角度6 + 当前末端位置3 + 目标位置3)
-        # [current_angles(6), target_joint_angles(6), current_position(3), target_position(3)]
-        states[:, 0:6] = current_angles
-        states[:, 6:12] = self.target_joint_angles
-        states[:, 12:15] = current_positions
-        states[:, 15:18] = self.target_positions
+        # 🎯 获取目标末端位姿（位置 + 姿态）
+        if not hasattr(self, "target_orientations"):
+            # 懒初始化：采样随机目标姿态
+            self.target_orientations = self._sample_random_orientations_batch()
+
+        # 🎯 计算自定义位姿误差向量 error = (Dϕ + Dθ + Dψ, Δθ)
+        pose_errors = torch.zeros((self.num_envs, 2), device=self.device)
+
+        for i in range(self.num_envs):
+            # 计算当前和目标位姿的旋转矩阵
+            current_quat = current_orientations[i]  # [w, x, y, z]
+            target_quat = self.target_orientations[i]  # [w, x, y, z]
+
+            # 转换为旋转矩阵
+            current_R = self._quaternion_to_rotation_matrix(current_quat)
+            target_R = self._quaternion_to_rotation_matrix(target_quat)
+
+            # 计算三个正交轴上的三点误差 Dϕ + Dθ + Dψ
+            # 使用轴角表示的差值在三个主轴上的投影
+            R_diff = target_R @ current_R.T  # 相对旋转矩阵
+            axis_angle = self._rotation_matrix_to_axis_angle(R_diff)
+
+            # 三个轴上的误差和：|axis_angle_x| + |axis_angle_y| + |axis_angle_z|
+            axis_error_sum = torch.sum(torch.abs(axis_angle))
+
+            # 四元数角差 Δθ
+            quat_angle_diff = self._quaternion_distance(current_quat, target_quat)
+
+            # 组合误差向量 (Dϕ + Dθ + Dψ, Δθ)
+            pose_errors[i, 0] = axis_error_sum
+            pose_errors[i, 1] = quat_angle_diff
+
+        # 🎯 新的状态向量 q_t = [关节角6 + 当前位姿7 + 目标位姿7 + 误差2]
+        # 总维度：6 + 7 + 7 + 2 = 22维
+        # 状态结构：[current_angles(6), current_pose(7), target_pose(7), pose_error(2)]
+        states[:, 0:6] = current_angles                           # q_t: 当前6个关节角
+        states[:, 6:9] = current_positions                        # p_e: 当前位置(3)
+        states[:, 9:13] = current_orientations                     # p_e: 当前姿态(4)
+        states[:, 13:16] = self.target_positions                  # p_t: 目标位置(3)
+        states[:, 16:20] = self.target_orientations                # p_t: 目标姿态(4)
+        states[:, 20:22] = pose_errors                             # error: (Dϕ+Dθ+Dψ, Δθ)
+
+        # 更新状态维度
+        self.state_dim = 22
 
         # 设备一致性检查
         if hasattr(self, '_debug_mode') and self._debug_mode:
-            if not check_tensor_devices({'states': states, 'target_positions': self.target_positions, 'target_joint_angles': self.target_joint_angles}, "_get_states"):
+            if not check_tensor_devices({
+                'states': states,
+                'target_positions': self.target_positions,
+                'target_orientations': self.target_orientations
+            }, "_get_states"):
                 print(f"⚠️ _get_states设备不一致")
 
         return states
@@ -1080,6 +1222,270 @@ class UR10ePPOEnvIsaac:
         # 返回末端位置
         ee_pos = T_cum[:3, 3]
         return ee_pos
+
+    def _forward_kinematics_with_orientation(self, joint_positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        UR10e forward kinematics with orientation (position + rotation)
+
+        Args:
+            joint_positions: [6] 关节角度张量
+
+        Returns:
+            ee_pos: [3] 末端执行器位置
+            ee_quat: [4] 末端执行器姿态（四元数 [w, x, y, z]）
+        """
+        import math
+
+        # 保证是 1D 向量 [6]
+        joint_positions = joint_positions.view(-1)
+        device = joint_positions.device
+        dtype = joint_positions.dtype
+
+        # UR10e DH参数 (基于官方规格)
+        d = torch.tensor(
+            [0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655],
+            device=device, dtype=dtype
+        )
+        a = torch.tensor(
+            [0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0],
+            device=device, dtype=dtype
+        )
+        alpha = torch.tensor(
+            [math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0],
+            device=device, dtype=dtype
+        )
+
+        # DH 变换函数
+        def dh_transform(theta, d_i, a_i, alpha_i):
+            ct = torch.cos(theta)
+            st = torch.sin(theta)
+            ca = torch.cos(alpha_i)
+            sa = torch.sin(alpha_i)
+
+            T = torch.zeros((4, 4), device=device, dtype=dtype)
+            T[0, 0] = ct
+            T[0, 1] = -st * ca
+            T[0, 2] = st * sa
+            T[0, 3] = a_i * ct
+
+            T[1, 0] = st
+            T[1, 1] = ct * ca
+            T[1, 2] = -ct * sa
+            T[1, 3] = a_i * st
+
+            T[2, 0] = 0.0
+            T[2, 1] = sa
+            T[2, 2] = ca
+            T[2, 3] = d_i
+
+            T[3, 3] = 1.0
+            return T
+
+        # 累积变换
+        T_cum = torch.eye(4, device=device, dtype=dtype)
+        for i in range(6):
+            T_i = dh_transform(joint_positions[i], d[i], a[i], alpha[i])
+            T_cum = T_cum @ T_i
+
+        # 提取位置
+        ee_pos = T_cum[:3, 3]
+
+        # 提取旋转矩阵
+        R = T_cum[:3, :3]
+
+        # 旋转矩阵转四元数
+        ee_quat = self._rotation_matrix_to_quaternion(R)
+
+        return ee_pos, ee_quat
+
+    def _rotation_matrix_to_quaternion(self, R: torch.Tensor) -> torch.Tensor:
+        """
+        将旋转矩阵转换为四元数
+
+        Args:
+            R: 3x3旋转矩阵
+
+        Returns:
+            四元数 [w, x, y, z]
+        """
+        # 使用Shepperd方法进行稳定的转换
+        trace = torch.trace(R)
+
+        if trace > 0:
+            S = torch.sqrt(trace + 1.0) * 2  # S = 4 * qw
+            qw = 0.25 * S
+            qx = (R[2, 1] - R[1, 2]) / S
+            qy = (R[0, 2] - R[2, 0]) / S
+            qz = (R[1, 0] - R[0, 1]) / S
+        elif (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
+            S = torch.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2  # S = 4 * qx
+            qw = (R[2, 1] - R[1, 2]) / S
+            qx = 0.25 * S
+            qy = (R[0, 1] + R[1, 0]) / S
+            qz = (R[0, 2] + R[2, 0]) / S
+        elif R[1, 1] > R[2, 2]:
+            S = torch.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2  # S = 4 * qy
+            qw = (R[0, 2] - R[2, 0]) / S
+            qx = (R[0, 1] + R[1, 0]) / S
+            qy = 0.25 * S
+            qz = (R[1, 2] + R[2, 1]) / S
+        else:
+            S = torch.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2  # S = 4 * qz
+            qw = (R[1, 0] - R[0, 1]) / S
+            qx = (R[0, 2] + R[2, 0]) / S
+            qy = (R[1, 2] + R[2, 1]) / S
+            qz = 0.25 * S
+
+        # 归一化四元数
+        quat = torch.tensor([qw, qx, qy, qz], device=R.device, dtype=R.dtype)
+        quat = quat / torch.norm(quat)
+
+        return quat
+
+    def _sample_random_orientations_batch(self) -> torch.Tensor:
+        """
+        批量采样随机目标姿态（四元数格式）
+
+        Returns:
+            orientations: [num_envs, 4] 四元数 [w, x, y, z]
+        """
+        orientations = torch.zeros((self.num_envs, 4), device=self.device)
+
+        for i in range(self.num_envs):
+            # 生成随机旋转轴
+            # 使用球坐标均匀采样单位球面 - 纯tensor实现
+            theta = torch.rand(1, device=self.device) * 2 * torch.pi  # 方位角 [0, 2π]
+            phi = torch.acos(1 - 2 * torch.rand(1, device=self.device))  # 极角 [0, π]
+
+            # 旋转轴 - 保持tensor计算
+            axis_x = torch.sin(phi) * torch.cos(theta)
+            axis_y = torch.sin(phi) * torch.sin(theta)
+            axis_z = torch.cos(phi)
+            axis = torch.cat([axis_x, axis_y, axis_z])  # 直接拼接为tensor
+
+            # 随机旋转角度 [0, π] - 保持tensor
+            angle = torch.rand(1, device=self.device) * torch.pi
+
+            # 旋转轴-角转四元数 - 纯tensor计算
+            half_angle = angle / 2
+            w = torch.cos(half_angle)
+            xyz = axis * torch.sin(half_angle)
+
+            # 直接设置到数组，避免不必要的转换
+            orientations[i, 0] = w
+            orientations[i, 1:4] = xyz
+
+        return orientations
+
+    def _quaternion_distance(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """
+        计算两个四元数之间的距离（最小旋转角度）
+
+        Args:
+            q1, q2: 四元数 [w, x, y, z]
+
+        Returns:
+            四元数距离（0到π之间）
+        """
+        # 确保四元数归一化
+        q1 = q1 / torch.norm(q1)
+        q2 = q2 / torch.norm(q2)
+
+        # 计算点积
+        dot_product = torch.dot(q1, q2).clamp(-1.0, 1.0)
+
+        # 四元数距离 = arccos(|dot_product|)
+        distance = torch.acos(torch.abs(dot_product))
+
+        return distance
+
+    def _quaternion_to_rotation_matrix(self, quat: torch.Tensor) -> torch.Tensor:
+        """
+        将四元数转换为旋转矩阵
+
+        Args:
+            quat: 四元数 [w, x, y, z]
+
+        Returns:
+            R: 3x3旋转矩阵
+        """
+        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+
+        # 四元数归一化
+        quat_norm = torch.sqrt(w**2 + x**2 + y**2 + z**2)
+        w, x, y, z = w/quat_norm, x/quat_norm, y/quat_norm, z/quat_norm
+
+        # 构建旋转矩阵
+        R = torch.zeros((3, 3), device=quat.device, dtype=quat.dtype)
+
+        R[0, 0] = 1 - 2*(y**2 + z**2)
+        R[0, 1] = 2*(x*y - z*w)
+        R[0, 2] = 2*(x*z + y*w)
+
+        R[1, 0] = 2*(x*y + z*w)
+        R[1, 1] = 1 - 2*(x**2 + z**2)
+        R[1, 2] = 2*(y*z - x*w)
+
+        R[2, 0] = 2*(x*z - y*w)
+        R[2, 1] = 2*(y*z + x*w)
+        R[2, 2] = 1 - 2*(x**2 + y**2)
+
+        return R
+
+    def _rotation_matrix_to_axis_angle(self, R: torch.Tensor) -> torch.Tensor:
+        """
+        将旋转矩阵转换为轴角表示
+
+        Args:
+            R: 3x3旋转矩阵
+
+        Returns:
+            axis_angle: 3D轴角向量 [rx, ry, rz]
+        """
+        # 使用Rodrigues公式转换
+        angle = torch.acos(torch.clamp((torch.trace(R) - 1) / 2, -1.0, 1.0))
+
+        if angle < 1e-6:
+            # 如果角度很小，返回零向量
+            return torch.zeros(3, device=R.device, dtype=R.dtype)
+
+        # 计算旋转轴
+        rx = R[2, 1] - R[1, 2]
+        ry = R[0, 2] - R[2, 0]
+        rz = R[1, 0] - R[0, 1]
+
+        axis = torch.tensor([rx, ry, rz], device=R.device, dtype=R.dtype)
+        axis = axis / (2 * torch.sin(angle))
+
+        # 轴角向量
+        axis_angle = angle * axis
+
+        return axis_angle
+
+    def _compute_end_effector_orientations_batch(self, joint_angles: torch.Tensor) -> torch.Tensor:
+        """
+        使用真实运动学计算末端执行器姿态的批处理版本
+
+        Args:
+            joint_angles: 关节角度 (num_envs, 6)
+
+        Returns:
+            末端执行器姿态 (num_envs, 4) 四元数格式 [w, x, y, z]
+        """
+        num_envs = joint_angles.shape[0]
+        orientations = torch.zeros((num_envs, 4), device=self.device)
+
+        for i in range(num_envs):
+            try:
+                # 使用扩展的正向运动学函数计算位置和姿态
+                _, quat = self._forward_kinematics_with_orientation(joint_angles[i])
+                orientations[i] = quat
+            except Exception as e:
+                print(f"⚠️ 姿态计算失败，使用单位四元数: {e}")
+                # 使用单位四元数作为默认值
+                orientations[i] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+
+        return orientations
 
     def _apply_velocity_pd_control(self, normalized_velocities: torch.Tensor):
         """
@@ -1325,68 +1731,91 @@ class UR10ePPOEnvIsaac:
     
     def _compute_rewards_batch(self, actions):
         """
-        改进版奖励函数：
-        - 关节误差 + 末端误差 的二次型惩罚
-        - 速度 / 力矩惩罚
-        - 朝目标靠拢的进步奖励
-        - 成功 bonus
+        点到点奖励函数：使用增强误差和对数压缩（与轨迹跟踪环境一致）
+
+        基于末端执行器位置误差的增强型奖励：
+        Reward = -[ω1 * e² + ln(e² + τ)]
+        其中 e 是位置误差，τ 是小常数
         """
         # 确保actions是2D tensor
         if actions.ndim == 1:
             actions = actions.unsqueeze(0)  # [6] -> [1, 6]
 
-        # 1. 当前关节 / 速度 / 末端位姿
+        # 1. 获取当前末端执行器位置
         current_angles, current_vels = self._get_joint_angles_and_velocities()
-        current_positions = self._compute_end_effector_positions_batch(current_angles)
+        current_positions = self._compute_end_effector_positions_batch(current_angles)  # [N, 3]
 
-        # 2. 误差（关节 + 末端）
-        joint_errors = self.target_joint_angles - current_angles     # [N,6]
-        pos_errors   = self.target_positions  - current_positions    # [N,3]
+        # 2. 计算位置误差
+        position_errors = torch.norm(self.target_positions - current_positions, dim=1)  # [N]
 
-        joint_norm = torch.norm(joint_errors, dim=1)   # [N]
-        pos_norm   = torch.norm(pos_errors,   dim=1)   # [N]
+        # 🎯 计算姿态误差
+        if not hasattr(self, "target_orientations"):
+            # 懒初始化：采样随机目标姿态
+            self.target_orientations = self._sample_random_orientations_batch()
 
-        # ==== 权重（建议先写死在这里，感觉好了再挪回 __init__）====
-        w_joint = 5.0      # 关节误差权重
-        w_pos   = 50.0     # 末端位置误差权重
-        w_vel   = 0.01     # 关节速度惩罚
-        w_tau   = 0.001    # 力矩惩罚
-        w_prog  = 5.0      # 进步奖励（上一步距离 - 这一步距离）
-        success_bonus = 20.0
+        # 计算当前姿态
+        current_orientations = self._compute_end_effector_orientations_batch(current_angles)  # [N, 4]
 
-        # 3. 基础二次型惩罚
-        joint_cost = joint_norm ** 2              # [N]
-        pos_cost   = pos_norm ** 2                # [N]
-        vel_cost   = torch.sum(current_vels**2, dim=1)
-        tau_cost   = torch.sum(actions**2,      dim=1)
+        # 计算姿态误差（四元数距离）
+        orientation_errors = torch.zeros(self.num_envs, device=self.device)
+        for i in range(self.num_envs):
+            orientation_errors[i] = self._quaternion_distance(
+                current_orientations[i], self.target_orientations[i]
+            )
 
-        reward = (
-            - w_joint * joint_cost
-            - w_pos   * pos_cost
-            #- w_vel   * vel_cost
-            - w_tau   * tau_cost
-        )
+        # 3. 初始化误差跟踪变量（用于进步奖励）
+        if not hasattr(self, "_prev_position_errors"):
+            self._prev_position_errors = torch.full((self.num_envs,), float('inf'), device=self.device)
 
-        # 4. 朝目标靠近的进步奖励（位置为主）
-        # 上一时刻的 pos_norm 存在 self.prev_pos_norm 里
-        """if not hasattr(self, "prev_pos_norm") or self.prev_pos_norm is None:
-            self.prev_pos_norm = pos_norm.detach()
-        else:
-            dist_diff = (self.prev_pos_norm - pos_norm)   # >0 说明在变近
-            reward = reward + w_prog * dist_diff
-            self.prev_pos_norm = pos_norm.detach()"""
+        # 4. 使用轨迹跟踪环境相同的奖励函数参数
+        w1 = self.trajectory_config.get("w1", 0.001) if hasattr(self, 'trajectory_config') else 0.001
+        lambda_ori = self.trajectory_config.get("lambda_ori", 0.5) if hasattr(self, 'trajectory_config') else 0.5
+        tau = self.trajectory_config.get("log_tau", 0.1) if hasattr(self, 'trajectory_config') else 0.1
 
-        # 5. 成功 bonus：同时满足关节 + 位置精度
-        joint_success = joint_norm < 0.052   # ~3°
-        pos_success   = pos_norm   < 0.05    # 5cm
-        success = joint_success & pos_success
-        reward = reward + success.float() * success_bonus
+        # 5. 基于对数压缩的奖励函数（逐个环境计算）
+        rewards = torch.zeros(self.num_envs, device=self.device)
 
-        reward = self.reward_scale*reward
+        for i in range(self.num_envs):
+            # 综合误差：位置误差 + 姿态误差
+            enhanced_error = position_errors[i] + lambda_ori * orientation_errors[i]
 
-        # 6. 可选：把 reward 控制在大致 [-100, +20] 级别就行
-        #    你可以不再乘 self.reward_scale，或者设成 1.0
-        return reward
+            # Reward = -[ω1 * e² + ln(e² + τ)]
+            reward_i = -(w1 * enhanced_error**2 + torch.log(1.0 + (enhanced_error**2)/tau))
+            rewards[i] = reward_i
+
+        # 6. 进步奖励：比上一帧更靠近目标就加分
+        """progress_weight = self.trajectory_config.get("progress_weight", 5.0) if hasattr(self, 'trajectory_config') else 5.0
+        prev_errors = self._prev_position_errors
+
+        # 计算进步（正数表示误差变小了）
+        progress = prev_errors - position_errors
+        progress_reward = progress_weight * torch.clamp(progress, min=0.0)  # 只奖励正向进步
+        rewards += progress_reward
+
+        # 7. 成功奖励：到达目标位置
+        success_threshold = 0.05  # 5cm
+        success_bonus = self.waypoint_bonus if hasattr(self, 'waypoint_bonus') else 10.0
+        success = position_errors < success_threshold
+        rewards += success.float() * success_bonus
+
+        # 8. 更新误差跟踪
+        self._prev_position_errors = position_errors.detach()"""
+
+        # 9. 应用奖励缩放
+        #rewards = self.reward_scale * rewards
+
+        # 10. 调试信息（每100步打印一次）
+        if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
+            avg_error = position_errors.mean().item()
+            avg_reward = rewards.mean().item()
+            #success_rate = success.float().mean().item()
+
+            print(f"📈 步骤{self.debug_step}:")
+            print(f"   平均位置误差: {avg_error:.4f} m")
+            print(f"   平均奖励: {avg_reward:.4f}")
+            #print(f"   成功率: {success_rate:.2%}")
+
+        return rewards
 
 
     def _check_done_batch(self) -> torch.Tensor:

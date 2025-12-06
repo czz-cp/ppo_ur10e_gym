@@ -21,10 +21,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal
 
-class ActorNetwork(nn.Module):
+class ActorNetwork_(nn.Module):
     """Actor网络 - PPO策略函数"""
 
-    def __init__(self, state_dim: int = 19, action_dim: int = 6, hidden_dim: int = 64):
+    def __init__(self, state_dim: int = 22, action_dim: int = 6, hidden_dim: int = 64):
         super().__init__()
 
         self.state_dim = state_dim
@@ -102,10 +102,171 @@ class ActorNetwork(nn.Module):
 
         return action, log_prob
 
-class CriticNetwork(nn.Module):
+class ActorNetwork(nn.Module):
+    """Actor网络 - 论文风格 3×256 tanh MLP，高斯策略 + tanh-squash + 动作集成"""
+
+    def __init__(self, state_dim: int = 22, action_dim: int = 6, hidden_dim: int = 256):
+        super().__init__()
+
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+
+        # 归一化动作空间 [-1, 1]^action_dim
+        self.register_buffer(
+            "action_limits_tensor",
+            torch.ones(action_dim, dtype=torch.float32)
+        )
+
+        # 特征提取 MLP：3 层 × 256, tanh 激活（对齐论文）
+        self.feature_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+        )
+
+        # 独立的 mean / log_std heads
+        self.mean_head = nn.Linear(hidden_dim, action_dim)
+        self.log_std_head = nn.Linear(hidden_dim, action_dim)
+
+        self._init_actor_weights()
+
+    def _init_actor_weights(self):
+        """Orthogonal 初始化 + 小输出，适配 tanh"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # tanh 通常用 gain=1.0 就够了
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        前向传播
+
+        Args:
+            state: [batch_size, state_dim]
+
+        Returns:
+            mean: [batch_size, action_dim]
+            std:  [batch_size, action_dim]
+        """
+        x = self.feature_net(state)              # [B, 256]
+
+        mean = self.mean_head(x)                 # [B, act_dim]
+        log_std = self.log_std_head(x)           # [B, act_dim]
+
+        # 防止 std 崩：限制 log_std 范围
+        log_std = torch.clamp(log_std, -4.0, 1.0)
+        # 和你现在一致，用 softplus 把它变成正数
+        std = F.softplus(log_std)
+
+        return mean, std
+
+    def sample(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        采样动作（保持你现在的 tanh-squash 结构不变）
+
+        Returns:
+            action:   [-1, 1] 内的归一化动作
+            log_prob: 高斯在 raw 空间的 log_prob（配合 update_policy 里的 atanh 反推）
+        """
+        mean, std = self.forward(state)
+        dist = Normal(mean, std)
+
+        # raw 空间的采样（rsample 方便以后重参数化）
+        raw = dist.rsample()
+        log_prob = dist.log_prob(raw).sum(dim=-1)
+
+        # tanh-squash 到 [-1, 1]
+        action = torch.tanh(raw)
+
+        return action, log_prob
+
+    def sample_with_ensemble(self, state: torch.Tensor, ensemble_size: int,
+                           use_delta_std: bool = True, delta_std: float = 0.1) -> torch.Tensor:
+        """
+        动作集成（Action Ensembles, AE）采样
+
+        根据论文：a_t,j ~ N(μ_θ(s_t), δ_θ), a_t = mean_j(a_t,j)
+
+        Args:
+            state: [batch_size, state_dim] 状态张量
+            ensemble_size: 集成采样次数 i
+            use_delta_std: 是否使用δ_θ而非σ_θ
+            delta_std: δ_θ固定标准差
+
+        Returns:
+            ensemble_action: [batch_size, action_dim] 集成平均后的动作
+        """
+        with torch.no_grad():  # 动作集成不需要梯度
+            mean, std = self.forward(state)
+            batch_size = state.shape[0]
+
+            # 使用论文建议的δ_θ（固定标准差）而非策略的标准差σ_θ
+            if use_delta_std:
+                std = torch.full_like(std, delta_std)
+
+            # 扩展维度用于批量采样：[batch_size, ensemble_size, action_dim]
+            mean_expanded = mean.unsqueeze(1).expand(batch_size, ensemble_size, -1)
+            std_expanded = std.unsqueeze(1).expand(batch_size, ensemble_size, -1)
+
+            # 创建分布并批量采样
+            dist = Normal(mean_expanded, std_expanded)
+            raw_samples = dist.sample()  # [batch_size, ensemble_size, action_dim]
+
+            # tanh-squash到[-1,1]
+            action_samples = torch.tanh(raw_samples)
+
+            # 集成平均：取ensemble维度上的平均
+            ensemble_action = action_samples.mean(dim=1)  # [batch_size, action_dim]
+
+            return ensemble_action
+
+    def compute_aew_ensemble_size(self, current_episode: int, max_episodes: int,
+                                alpha: float = 5.0, beta: float = 8.0) -> int:
+        """
+        计算AEW（Weibull Action Ensembles）的采样次数
+
+        根据论文：i ~ clip(Weibull(k, λ), 1, λ)
+        其中 k = 1 + α * episode / episode_max, λ = 1 + β * episode / episode_max
+
+        Args:
+            current_episode: 当前训练episode
+            max_episodes: 最大训练episode数
+            alpha: Weibull形状参数增长系数
+            beta: Weibull尺度参数增长系数
+
+        Returns:
+            ensemble_size: 采样次数 i
+        """
+        progress = current_episode / max(max_episodes, 1)  # 防止除零
+
+        # 计算Weibull分布参数
+        k = 1.0 + alpha * progress  # 形状参数
+        lam = 1.0 + beta * progress  # 尺度参数
+
+        # 从Weibull分布采样
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+
+        # Weibull采样：u ~ Uniform(0,1), x = λ * (-log(u))^(1/k)
+        u = torch.rand(1, device=device)
+        weibull_sample = lam * (-torch.log(u)).pow(1.0 / k)
+
+        # 裁剪到[1, λ]范围并转为整数
+        ensemble_size = torch.clamp(weibull_sample, 1.0, lam).int().item()
+
+        return ensemble_size
+
+
+class CriticNetwork_(nn.Module):
     """Critic网络 - PPO价值函数"""
 
-    def __init__(self, state_dim: int = 19, hidden_dim: int = 64):
+    def __init__(self, state_dim: int = 22, hidden_dim: int = 64):
         super().__init__()
 
         # 价值网络
@@ -136,6 +297,40 @@ class CriticNetwork(nn.Module):
             value: [batch_size, 1] 状态价值
         """
         return self.value_net(state)
+
+class CriticNetwork(nn.Module):
+    """Critic网络 - 论文风格 3×256 tanh MLP"""
+
+    def __init__(self, state_dim: int = 22, hidden_dim: int = 256):
+        super().__init__()
+
+        self.value_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.orthogonal_(module.weight.data, gain=1.0)
+            nn.init.constant_(module.bias.data, 0.0)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            state: [batch_size, state_dim]
+
+        Returns:
+            value: [batch_size, 1]
+        """
+        return self.value_net(state)
+
 
 class PPOIsaac:
     """
@@ -195,11 +390,11 @@ class PPOIsaac:
         assert all(p.requires_grad for p in self.critic.parameters()), "Critic参数未设置requires_grad"
 
         # 优化器
-        self.actor_optimizer = optim.Adam(
+        self.actor_optimizer = optim.AdamW(
             self.actor.parameters(),
             lr=float(config['ppo']['lr_actor'])
         )
-        self.critic_optimizer = optim.Adam(
+        self.critic_optimizer = optim.AdamW(
             self.critic.parameters(),
             lr=float(config['ppo']['lr_critic'])
         )
@@ -211,10 +406,28 @@ class PPOIsaac:
             clip_range=10.0
         ).to(self.device)
 
-        # GAE计算器
+        # 🎯 动作集成（Action Ensembles, AE）配置
+        ae_config = config.get('ae', {})
+        self.ae_enabled = ae_config.get('enabled', False)
+        self.ae_alpha = float(ae_config.get('alpha', 5.0))
+        self.ae_beta = float(ae_config.get('beta', 8.0))
+        self.ae_delta_std = float(ae_config.get('delta_std', 0.1))
+        self.current_ensemble_size = 1  # 默认采样次数
+
+        # 🎯 策略反馈（Policy Feedback, PF）配置
+        pf_config = config.get('pf', {})
+        self.pf_enabled = pf_config.get('enabled', False)
+        self.pf_eta_min = float(pf_config.get('eta_min', 0.6))
+        self.pf_eta_max = float(pf_config.get('eta_max', 0.99))
+
+        # GAE计算器（支持策略反馈）- 必须在pf_config定义之后
         self.gae = GAE(
             gamma=float(config['ppo']['gamma']),
-            lam=float(config['ppo']['lam'])
+            lam=float(config['ppo']['lam']),
+            device=self.device,
+            use_adaptive_gamma=self.pf_enabled,
+            eta_min=self.pf_eta_min,
+            eta_max=self.pf_eta_max
         )
 
         # 训练参数 - 确保类型转换
@@ -227,6 +440,7 @@ class PPOIsaac:
         self.rollout_length = int(config['train']['rollout_length'])
         self.batch_size = int(config['train']['batch_size'])
         self.num_updates = int(config['train']['num_updates'])
+        self.num_episodes = int(config['train']['num_episodes'])
 
         # 统计信息
         self.episode_count = 0
@@ -239,10 +453,28 @@ class PPOIsaac:
         print(f"   动作维度: {self.action_dim}")
         print(f"   设备: {self.device}")
 
+        # 🎯 显示AE���PF状态
+        print(f"   🎯 动作集成(AE): {'启用' if self.ae_enabled else '禁用'}")
+        if self.ae_enabled:
+            print(f"      Alpha: {self.ae_alpha}, Beta: {self.ae_beta}, Delta_std: {self.ae_delta_std}")
+        print(f"   🎯 策略反馈(PF): {'启用' if self.pf_enabled else '禁用'}")
+        if self.pf_enabled:
+            print(f"      Eta范围: [{self.pf_eta_min}, {self.pf_eta_max}]")
+
         # 梯度计算测试
         if not self._test_gradient_flow():
             print("❌ 梯度计算测试失败")
             raise RuntimeError("梯度计算测试失败，请检查网络实现")
+
+    def update_ensemble_size(self):
+        """根据当前训练进度更新AE采样次数"""
+        if self.ae_enabled:
+            self.current_ensemble_size = self.actor.compute_aew_ensemble_size(
+                current_episode=self.episode_count,
+                max_episodes=self.num_episodes,
+                alpha=self.ae_alpha,
+                beta=self.ae_beta
+            )
 
     def _test_gradient_flow(self):
         """测试梯度计算是否正常工作"""
@@ -334,7 +566,25 @@ class PPOIsaac:
             # 采样动作 (数据收集时使用no_grad，但状态需要梯度)
             states_for_sampling = states.detach().requires_grad_(True)
             with torch.no_grad():
-                actions, log_probs = self.actor.sample(states_for_sampling)
+                # 🎯 使用动作集成（AE）采样（如果启用）
+                if self.ae_enabled:
+                    # 更新采样次数
+                    self.update_ensemble_size()
+
+                    # 使用AE采样动作（平均后的动作）
+                    actions = self.actor.sample_with_ensemble(
+                        states_for_sampling,
+                        ensemble_size=self.current_ensemble_size,
+                        use_delta_std=True,
+                        delta_std=self.ae_delta_std
+                    )
+
+                    # 为训练计算标准采样的log_prob（用于策略更新）
+                    _, log_probs = self.actor.sample(states_for_sampling)
+                else:
+                    # 标准PPO采样
+                    actions, log_probs = self.actor.sample(states_for_sampling)
+
                 values = self.critic(states_for_sampling)
 
             # 调试信息 (每64步显示一次进度)
@@ -489,8 +739,18 @@ class PPOIsaac:
             # 修复：为GAE函数创建正确形状的next_values [T, N]
             next_values_expanded = next_values.unsqueeze(0).expand(self.rollout_length, -1)  # [T, N]
 
-        # 计算GAE优势和回报
-        advantages, returns = self.gae(rewards, dones, values, next_values_expanded)
+        # 计算GAE优势和回报（支持策略反馈）
+        if self.pf_enabled:
+            # 🎯 策略反馈：需要动作概率来计算自适应折扣因子
+            with torch.no_grad():
+                policy_dist = Normal(self.actor(states)[0], self.actor(states)[1])
+                action_probs = torch.exp(policy_dist.log_prob(actions).sum(dim=-1))
+                action_probs = action_probs.view(self.rollout_length, self.num_envs)
+
+                advantages, returns = self.gae(rewards, dones, values, next_values_expanded, action_probs)
+        else:
+            # 标准GAE
+            advantages, returns = self.gae(rewards, dones, values, next_values_expanded)
 
         # 展平
         advantages = advantages.view(-1).float()  # [T*N]
@@ -557,14 +817,8 @@ class PPOIsaac:
                 surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * batch_advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
 
-                # 熵正则化（添加监控和限制）
+                # 熵正则化
                 entropy = dist.entropy().sum(dim=-1).mean()
-
-                # 🔴 限制过大的熵值，防止奖励函数被破坏
-                max_entropy = 5.0  # 设置合理的熵上限
-                if entropy.item() > max_entropy:
-                    print(f"⚠️ 熵值过大: {entropy.item():.3f}，限制到 {max_entropy}")
-                    entropy = torch.tensor(max_entropy, device=entropy.device, dtype=entropy.dtype)
 
                 # Critic损失
                 batch_values = self.critic(batch_states).squeeze(-1).float()

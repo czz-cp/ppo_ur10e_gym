@@ -184,6 +184,19 @@ trajectory_tracking:
   w1: 0.0001                      # 位置误差权重
   lambda_ori: 0.5                # 姿态误差权重
 
+# 🎯 动作集成（Action Ensembles, AE）配置
+ae:
+  enabled: true                  # 启用动作集成
+  alpha: 5.0                     # Weibull形状参数增长系数
+  beta: 8.0                      # Weibull尺度参数增长系数
+  delta_std: 0.1                 # AE标准差（论文建议值）
+
+# 🎯 策略反馈（Policy Feedback, PF）配置
+pf:
+  enabled: true                  # 启用策略反馈
+  eta_min: 0.6                   # 最小折扣因子
+  eta_max: 0.99                  # 最大折扣因子
+
 # 调试和监控
 debug:
   log_level: "INFO"              # 日志级别

@@ -1,3 +1,8 @@
+ae:
+  alpha: 5.0
+  beta: 8.0
+  delta_std: 0.1
+  enabled: true
 debug:
   log_level: INFO
   monitor_frequency: 10
@@ -6,8 +11,8 @@ device: cuda:0
 env:
   device_id: 0
   dt: 0.01
-  max_steps: 256
-  num_envs: 1
+  max_steps: 300
+  num_envs: 2
   target_range:
     x:
     - -0.6
@@ -16,10 +21,25 @@ env:
     - -0.6
     - 0.6
     z:
-    - 0.1
-    - 0.8
+    - 0.0
+    - 0.6
 graphics:
   graphics_device_id: 0
+joint_limits:
+  lower_limits:
+  - -6.283
+  - -6.283
+  - -3.142
+  - -6.283
+  - -6.283
+  - -6.283
+  upper_limits:
+  - 6.283
+  - 6.283
+  - 3.142
+  - 6.283
+  - 6.283
+  - 6.283
 network:
   actor:
     activation: relu
@@ -29,15 +49,19 @@ network:
     activation: relu
     hidden_dim: 64
     num_layers: 3
+pf:
+  enabled: true
+  eta_max: 0.99
+  eta_min: 0.6
 pid_params:
   base_gains:
     d:
-    - 80.0
     - 50.0
-    - 40.0
-    - 15.0
-    - 15.0
+    - 50.0
+    - 30.0
+    - 20.0
     - 10.0
+    - 5.0
     i:
     - 0.0
     - 0.0
@@ -46,19 +70,19 @@ pid_params:
     - 0.0
     - 0.0
     p:
-    - 2000.0
-    - 1500.0
-    - 1200.0
-    - 300.0
-    - 300.0
+    - 1000.0
+    - 1000.0
+    - 800.0
+    - 400.0
     - 200.0
+    - 100.0
   torque_limits:
-  - 264.0
-  - 264.0
-  - 120.0
-  - 43.2
-  - 43.2
-  - 43.2
+  - 330.0
+  - 330.0
+  - 150.0
+  - 54.0
+  - 54.0
+  - 54.0
 ppo:
   clip_eps: 0.15
   entropy_coef: 0.01
@@ -97,6 +121,17 @@ sim:
   substeps: 2
   use_gpu: true
   use_gpu_pipeline: false
+task_space:
+  workspace_bounds:
+    x:
+    - -1.2
+    - 1.2
+    y:
+    - -1.2
+    - 1.2
+    z:
+    - -1.3
+    - 1.0
 train:
   batch_size: 64
   log_interval: 10
@@ -104,11 +139,44 @@ train:
   num_updates: 10
   rollout_length: 512
   save_interval: 100
+trajectory_tracking:
+  deviation_coef: 2.0
+  distance_weight: 2.0
+  lambda_ori: 0.5
+  log_tau: 0.1
+  progress_weight: 3.0
+  smooth_coef: 0.1
+  use_deviation_penalty: false
+  w1: 0.0001
+  waypoint_bonus: 5.0
+  waypoint_threshold: 0.15
+trajectory_visualization:
+  auto_show_plots: false
+  enable_trajectory_plotting: false
+  plot_save_dir: ./trajectory_plots
+  save_interval_episodes: 10
+ts_rrt_star:
+  goal_bias: 0.1
+  goal_tolerance: 0.15
+  max_iterations: 2000
+  max_waypoints: 100
+  replanning_threshold: 0.1
+  step_size: 0.05
 value_normalization:
   beta: 0.995
   clip_range: 10.0
   enabled: true
   epsilon: 1e-5
+velocity_control:
+  enabled: true
+  integration_dt: 0.01
+  velocity_limits:
+  - 2.094
+  - 2.094
+  - 3.142
+  - 3.142
+  - 3.142
+  - 3.142
 visualization:
   enable: true
   render_freq: 1

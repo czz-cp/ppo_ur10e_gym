@@ -124,8 +124,8 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
         self.joint_lower_limits_tensor = torch.tensor(self.joint_lower_limits, device=self.device)
         self.joint_upper_limits_tensor = torch.tensor(self.joint_upper_limits, device=self.device)
 
-        # Override observation space always (19D)
-        self._define_observation_space_19d()
+        # Override observation space always (22D with compact pose error)
+        self._define_observation_space_22d()
 
         print(f"✅ UR10eTrajectoryEnvIsaac initialized:")
         print(f"   🎯 Control Mode: {self.mode}")
@@ -198,16 +198,19 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
 
         print(f"🔁 Switched UR10eTrajectoryEnvIsaac mode to: {self.mode}")
 
-    def _define_observation_space_19d(self):
+    def _define_observation_space_22d(self):
         """
-        Define 19D observation space for trajectory tracking:
+        Define 22D observation space using compact pose error representation:
 
-        19D = [joint_pos(6) + joint_vel(6) + delta_to_waypoint(3) + progress(1) + tcp_pos(3)]
+        22D = [joint_pos(6) + current_pose(7) + target_pose(7) + pose_error(2)]
 
-        Key insight: Use relative position (delta) instead of absolute positions
-        for better alignment with reward function and generalization.
+        State components:
+        - q_t: current 6 joint angles
+        - p_e: current end-effector pose (position(3) + orientation(4))
+        - p_t: target end-effector pose (position(3) + orientation(4))
+        - error: custom pose error (Dϕ+Dθ+Dψ, Δθ)
         """
-        obs_dim = 19  # Trajectory tracking: joints + velocities + delta + progress + tcp_pos
+        obs_dim = 22  # Compact pose error representation
         self.state_dim = obs_dim  # Override parent's state_dim
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -216,8 +219,9 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
             dtype=np.float32
         )
 
-        print(f"🎯 Trajectory observation space: {obs_dim}D")
-        print(f"   Structure: [joint_pos(6) + joint_vel(6) + delta_to_waypoint(3) + progress(1) + tcp_pos(3)]")
+        print(f"🎯 Compact pose observation space: {obs_dim}D")
+        print(f"   Structure: [joint_pos(6) + current_pose(7) + target_pose(7) + pose_error(2)]")
+        print(f"   Components: q_t(6) + p_e(7) + p_t(7) + error(2)")
 
     def plan_trajectory(self, start_tcp: np.ndarray, goal_tcp: np.ndarray) -> bool:
         """
@@ -308,39 +312,17 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
         return planner.current_waypoints[idx]
 
     def get_observation(self):
-        """Get 19D observation for trajectory tracking"""
-        obs_list = []
-        for i in range(self.num_envs):
-            # Get joint states from parent method
-            current_angles, current_vels = self._get_joint_angles_and_velocities()
-            q = current_angles[i].detach().cpu().numpy()
-            qd = current_vels[i].detach().cpu().numpy()
+        """Get 22D observation using compact pose error representation"""
+        # 直接使用父类的新状态表示
+        states = super()._get_states()
 
-            # Compute TCP position
-            tcp = self._compute_end_effector_positions_batch(current_angles)[i].detach().cpu().numpy()
+        # 转换为numpy格式
+        if isinstance(states, torch.Tensor):
+            obs = states.detach().cpu().numpy()
+        else:
+            obs = states
 
-            if self.mode == "trajectory_tracking" and self.current_ts_waypoints:
-                wp = self.ts_planners[i].get_current_waypoint()
-                if wp is not None:
-                    wp_pos = np.asarray(wp.cartesian_position, np.float32)
-                    delta = wp_pos - tcp
-                    prog = self.ts_planners[i].current_waypoint_index / max(1, len(self.current_ts_waypoints)-1)
-                else:
-                    delta = np.zeros(3, np.float32)
-                    prog = 1.0
-            else:
-                # Point-to-point mode: use target position
-                if hasattr(self, 'target_positions') and self.target_positions is not None:
-                    target_pos = self.target_positions[i].detach().cpu().numpy()
-                    delta = target_pos - tcp
-                else:
-                    delta = np.zeros(3, np.float32)
-                prog = 0.0
-
-            obs_i = np.concatenate([q, qd, delta, np.array([prog], np.float32), tcp]).astype(np.float32)
-            obs_list.append(obs_i)
-
-        return obs_list[0] if self.num_envs == 1 else np.stack(obs_list, axis=0)
+        return obs[0] if self.num_envs == 1 else obs
 
     def _trajectory_reward(self, tcp_pos, action_tensor, env_id: int = 0):
         """
@@ -474,10 +456,9 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
         num_envs = joint_angles.shape[0]
         device = joint_angles.device
 
-        # 简化版本：返回单位四元数（无旋转）
-        # 实际应用中应该基于关节角度计算真实的末端执行器姿态
-        default_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)  # [w, x, y, z]
-        orientations = default_orientation.unsqueeze(0).repeat(num_envs, 1)
+        # 🎯 使用真实的正向运动学计算姿态
+        # 从父类调用姿态计算函数
+        orientations = self._compute_end_effector_orientations_batch(joint_angles)
 
         return orientations
 
@@ -555,6 +536,7 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
                 if self.visualizer and i == 0:  # 只记录第一个环境的轨迹
                     joint_angles_i = current_angles[i].detach().cpu().numpy()
                     action_i = action_tensor[i].detach().cpu().numpy() if action_tensor is not None else None
+                    current_tcp_i = current_tcp[i]
                     self.visualizer.add_trajectory_point(current_tcp_i.detach().cpu().numpy(), joint_angles_i, action_i)
 
                 # 4) Completion check per env
@@ -654,19 +636,8 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
                 current_angles, _ = self._get_joint_angles_and_velocities()
                 start_tcp = self._compute_end_effector_positions_batch(current_angles)[0].detach().cpu().numpy()
 
-                # 从 task_space_config 里读 workspace_bounds
-                ws_cfg = self.task_space_config.get("workspace_bounds", {})
-                def _axis(name, default):
-                    return ws_cfg.get(name, default)
-
-                goal_tcp = np.array(
-                    [
-                        np.random.uniform(*_axis("x", [-0.6, 0.6])),
-                        np.random.uniform(*_axis("y", [-0.6, 0.6])),
-                        np.random.uniform(*_axis("z", [0.2, 0.8])),
-                    ],
-                    dtype=np.float32,
-                )
+                # 🎯 使用球体-圆柱工作空间采样目标位置
+                goal_tcp = self._sample_goal_position_workspace()
 
                 planned = self.plan_trajectory(start_tcp, goal_tcp)
 
@@ -713,6 +684,46 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
             'planner_stats': self.ts_planner.get_statistics() if self.ts_planner else {},
             'trajectory_completed': self.trajectory_completed
         }
+
+    def _sample_goal_position_workspace(self) -> np.ndarray:
+        """
+        在球体-圆柱工作空间中采样目标位置
+
+        工作空间定义：
+        - 以机械臂基座为中心，��径 0.85m 的球体
+        - 挖去半径 0.30m 的竖直圆柱（包着机械臂底座）
+
+        Returns:
+            goal_position: [3] 目标位置数组 [x, y, z]
+        """
+        # 工作空间参数
+        sphere_radius = 0.85  # 球体半径
+        cylinder_radius = 0.30  # 圆柱半径
+        max_attempts = 1000  # 最大采样尝试次数
+
+        for attempt in range(max_attempts):
+            # 在球体内采样 - 使用球坐标均匀采样
+            r = sphere_radius * (np.random.random() ** (1/3))  # 立方根保证体积均匀
+            theta = np.random.random() * 2 * np.pi  # 方位角 [0, 2π]
+            phi = np.arccos(1 - 2 * np.random.random())  # 极角 [0, π]
+
+            # 转换为笛卡尔坐标
+            x = r * np.sin(phi) * np.cos(theta)
+            y = r * np.sin(phi) * np.sin(theta)
+            z = r * np.cos(phi)
+
+            # 检查是否在圆柱外（圆柱以z轴为中心）
+            radial_dist = np.sqrt(x**2 + y**2)
+
+            # 排除圆柱内部，并确保z坐标不要太低（避免地面碰撞）
+            if radial_dist > cylinder_radius and z > 0.2:  # z > 0.2m 给机械臂留足够空间
+                return np.array([x, y, z], dtype=np.float32)
+
+        # 如果采样失败，使用默认位置
+        print(f"⚠️ 轨迹目标位置采样失败，使用默认位置")
+        # 使用一个安全的默认位置：球体边界上远离圆柱的位置
+        default_pos = np.array([sphere_radius * 0.6, 0, 0.5], dtype=np.float32)
+        return default_pos
 
 
 def test_trajectory_environment():
