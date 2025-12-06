@@ -72,10 +72,9 @@ class ActorNetwork(nn.Module):
         policy_output = self.policy_net(state)
         mean, log_std = policy_output.chunk(2, dim=-1)
 
-        log_std = torch.clamp(log_std, -2.0, 2.0)
-        #std = F.softplus(log_std)   # 确保标准差为正
-        #softplus(x) = log(1 + exp(x))
-        std = torch.exp(log_std) 
+        # 更严格的 log_std 限制���防止标准差过大
+        log_std = torch.clamp(log_std, -4.0, 1.0)  # std范围: e^(-4)≈0.018 到 e^(1)≈2.7
+        std = F.softplus(log_std)   # 使用 softplus 更平滑，防止 std 暴增 
         return mean, std
 
     def sample(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -558,15 +557,21 @@ class PPOIsaac:
                 surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * batch_advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
 
-                # 熵正则化
+                # 熵正则化（添加监控和限制）
                 entropy = dist.entropy().sum(dim=-1).mean()
+
+                # 🔴 限制过大的熵值，防止奖励函数被破坏
+                max_entropy = 5.0  # 设置合理的熵上限
+                if entropy.item() > max_entropy:
+                    print(f"⚠️ 熵值过大: {entropy.item():.3f}，限制到 {max_entropy}")
+                    entropy = torch.tensor(max_entropy, device=entropy.device, dtype=entropy.dtype)
 
                 # Critic损失
                 batch_values = self.critic(batch_states).squeeze(-1).float()
                 normalized_returns = self.value_norm.normalize(batch_returns).float()
                 critic_loss = F.mse_loss(batch_values, normalized_returns.detach())
 
-                # 总损失
+                # 总损失（确保熵项符号正确）
                 loss = actor_loss + self.value_coef * critic_loss - self.entropy_coef * entropy
 
                 # 梯度计算验证 (调试模式)
@@ -826,7 +831,7 @@ def get_default_config_isaac() -> Dict[str, Any]:
             'clip_eps': 0.2,
             'gamma': 0.99,
             'lam': 0.95,
-            'entropy_coef': 0.01,
+            'entropy_coef': 0.001,  # 大幅减小 entropy 系数
             'value_coef': 0.5,
             'max_grad_norm': 0.5
         },

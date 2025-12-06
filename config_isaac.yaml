@@ -89,6 +89,8 @@ reward:
   extra:
     success_reward: 5.0          # 关节到达成功奖励
     position_success_reward: 2.0  # 末端位置成功奖励
+  
+  
 
 # 🚀 速度控制配置
 velocity_control:
@@ -178,6 +180,9 @@ trajectory_tracking:
   deviation_coef: 2.0            # 路径偏离惩罚系数
   distance_weight: 2.0           # 距离惩罚权重
   progress_weight: 3.0           # 进步奖励权重
+  log_tau: 0.1                  # 对数奖励函数中的τ值
+  w1: 0.0001                      # 位置误差权重
+  lambda_ori: 0.5                # 姿态误差权重
 
 # 调试和监控
 debug:

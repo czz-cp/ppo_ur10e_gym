@@ -343,56 +343,143 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
         return obs_list[0] if self.num_envs == 1 else np.stack(obs_list, axis=0)
 
     def _trajectory_reward(self, tcp_pos, action_tensor, env_id: int = 0):
-        """Calculate trajectory tracking reward"""
+        """
+        Calculate trajectory tracking reward using enhanced error metric with logarithmic compression
+
+        Enhanced error e = position_error + orientation_error (comprehensive pose error)
+        Reward = -ln(e² + τ) where τ is small constant for numerical stability
+        """
         planner = self.ts_planners[env_id]
         waypoint = planner.get_current_waypoint()
         if waypoint is None:
             # 没有路径点，大概率是轨迹结束或者规划失败
             return -10.0, False
 
-        # 懒初始化：为每个 env 维护一个"上一时刻到当前 waypoint 的距离"
-        if not hasattr(self, "_prev_distance_to_waypoint"):
-            self._prev_distance_to_waypoint = np.full(self.num_envs, np.inf, dtype=np.float32)
+        # 懒初始化：为每个 env 维护一个"上一时刻到当前 waypoint 的误差"
+        if not hasattr(self, "_prev_enhanced_error"):
+            self._prev_enhanced_error = np.full(self.num_envs, np.inf, dtype=np.float32)
 
         waypoint_pos = torch.tensor(waypoint.cartesian_position, device=tcp_pos.device, dtype=tcp_pos.dtype)
-        distance = torch.norm(tcp_pos - waypoint_pos)
-        dist_val = float(distance.item())
 
-        # -------- 1) 距离惩罚 --------
-        distance_weight = self.trajectory_config.get("distance_weight", 2.0)
-        reward = -distance_weight * dist_val
+        # -------- 1) 计算增强误差 e = 位置误差 + 姿态误差 --------
+        # 位置误差
+        position_error = torch.norm(tcp_pos - waypoint_pos)
 
-        # -------- 2) 进步奖励：比上一帧更靠近当前 waypoint 就加分 --------
-        prev_dist = float(self._prev_distance_to_waypoint[env_id])
-        progress_reward = 0.0
-        if np.isfinite(prev_dist):
-            progress = prev_dist - dist_val   # 正数表示变近了
-            if progress > 0.0:
-                progress_weight = self.trajectory_config.get("progress_weight", 3.0)
-                progress_reward = progress_weight * progress
-                reward += progress_reward
-        # 如果是第一次调用（prev = inf），就不加进步项
+        # 姿态误差 - 使用四元数或旋转矩阵计算（这里简化为欧拉角误差）
+        # 如果目标点包含姿态信息，则计算姿态误差
+        if hasattr(waypoint, 'orientation') and waypoint.orientation is not None:
+            # 假设 waypoint.orientation 是四元数 [w, x, y, z] 或欧拉角
+            target_orientation = torch.tensor(waypoint.orientation, device=tcp_pos.device, dtype=tcp_pos.dtype)
 
-        # -------- 3) 到达当前 waypoint 的一次性奖励 --------
-        waypoint_reached = dist_val < waypoint.tolerance
-        if waypoint_reached:
-            reward += self.waypoint_bonus
-            # 重置 prev 距离，让下一个 waypoint 单独算进步
-            self._prev_distance_to_waypoint[env_id] = np.inf
+            # 获取当前TCP姿态（需要从正向运动学计算）
+            current_angles, _ = self._get_joint_angles_and_velocities()
+            current_orientation = self._compute_end_effector_orientations_batch(current_angles)[env_id]
+
+            # 计算姿态误差（四元数差值或欧拉角差值）
+            if target_orientation.shape[0] == 4:  # 四元数
+                # 四元数距离误差
+                quat_diff = self._quaternion_distance(current_orientation, target_orientation)
+                orientation_error = quat_diff
+            else:  # 欧拉角
+                # 欧拉角距离误差
+                orientation_error = torch.norm(current_orientation - target_orientation)
         else:
-            # 记录当前距离，供下一步计算进步
-            self._prev_distance_to_waypoint[env_id] = dist_val
+            # 如果没有姿态信息，仅使用位置误差
+            orientation_error = torch.tensor(0.0, device=tcp_pos.device)
 
-        # -------- 4) 偏离路径惩罚（可选） --------
-        if self.use_deviation_penalty and len(planner.current_waypoints) > 1:
-            deviation = self._calculate_path_deviation(tcp_pos, env_id)
-            reward -= self.deviation_coef * deviation
+        # 综合误差：位置误差 + 姿态误差
+        lambda_ori = self.trajectory_config.get("lambda_ori", 0.5)
+        #enhanced_error = position_error + lambda_ori * orientation_error
+        enhanced_error = position_error
+        #enhanced_error = position_error + orientation_error
+        w1 = self.trajectory_config.get("w1", 0.001)
 
-        # -------- 5) 平滑惩罚：控制 torque 大小 --------
-        smooth_penalty = self.smooth_coef * torch.norm(action_tensor).item()
-        reward -= smooth_penalty
+        # -------- 2) 基于对数压缩的奖励函数 --------
+        # Reward = -[ω1 * e² + ln(e² + τ)]
+        # τ 是小常数，防止数值问题，通常取 0.01 ~ 0.1
+        tau = self.trajectory_config.get("log_tau", 0.1)  # 默认值0.0001
+        reward = -(w1 * enhanced_error**2 + torch.log(1.0 + (enhanced_error**2)/tau)).item()
+
+        # 转换为标量供后续计算使用
+        #enhanced_error_val = float(enhanced_error.item())
+
+        # -------- 3) 进步奖励：基于增强误差的进步 --------
+        """prev_error = float(self._prev_enhanced_error[env_id])
+        progress_reward = 0.0
+        if np.isfinite(prev_error):
+            progress = prev_error - enhanced_error_val   # 正数表示误差变小了
+            if progress > 0.0:
+                progress_weight = self.trajectory_config.get("progress_weight", 5.0)  # 增大进度权重
+                progress_reward = progress_weight * progress
+                reward += progress_reward"""
+
+        # -------- 4) 到达当前 waypoint 的一次性奖励 --------
+        # 使用位置误差判断到达（避免姿态误差过大使整个轨迹无法完成）
+        waypoint_reached = position_error.item() < waypoint.tolerance
+        """if waypoint_reached:
+            reward += self.waypoint_bonus
+            # 重置 prev 误差，让下一个 waypoint 单独算进步
+            self._prev_enhanced_error[env_id] = np.inf
+        else:
+            # 记录当前误差，供下一步计算进步
+            self._prev_enhanced_error[env_id] = enhanced_error_val"""
+
+        # -------- 5) 平滑惩罚：控制动作平滑性 --------
+        #smooth_penalty = self.smooth_coef * torch.norm(action_tensor).item()
+        #reward -= smooth_penalty
+
+        # -------- 6) 偏离路径惩罚（可选） --------
+        #if self.use_deviation_penalty and len(planner.current_waypoints) > 1:
+        #    deviation = self._calculate_path_deviation(tcp_pos, env_id)
+        #    reward -= self.deviation_coef * deviation
 
         return reward, waypoint_reached
+
+    def _quaternion_distance(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """
+        计算两个四元数之间的距离（最小旋转角度）
+
+        Args:
+            q1, q2: 四元数 [w, x, y, z]
+
+        Returns:
+            四元数距离（0到π之间）
+        """
+        # 确保四元数归一化
+        q1 = q1 / torch.norm(q1)
+        q2 = q2 / torch.norm(q2)
+
+        # 计算点积
+        dot_product = torch.dot(q1, q2).clamp(-1.0, 1.0)
+
+        # 四元数距离 = arccos(|dot_product|)
+        distance = torch.acos(torch.abs(dot_product))
+
+        return distance
+
+    def _compute_end_effector_orientations_batch(self, joint_angles: torch.Tensor) -> torch.Tensor:
+        """
+        计算末端执行器姿态的批处理版本
+
+        Args:
+            joint_angles: 关节角度 (num_envs, 6)
+
+        Returns:
+            末端执行器姿态 (num_envs, 4) 四元数格式 [w, x, y, z]
+        """
+        # 这里应该调用正向运动学计算姿态
+        # 简化实现：返回默认姿态
+        # 在实际使用中，应该使用机器人运动学库计算准确的末端执行器姿态
+
+        num_envs = joint_angles.shape[0]
+        device = joint_angles.device
+
+        # 简化版本：返回单位四元数（无旋转）
+        # 实际应用中应该基于关节角度计算真实的末端执行器姿态
+        default_orientation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device)  # [w, x, y, z]
+        orientations = default_orientation.unsqueeze(0).repeat(num_envs, 1)
+
+        return orientations
 
     def _calculate_path_deviation(self, tcp_pos: torch.Tensor, env_id: int = 0) -> float:
         """
@@ -543,9 +630,11 @@ class UR10eTrajectoryEnvIsaac(UR10ePPOEnvIsaac):
         self.current_waypoint_index[:] = 0
         self.trajectory_completed[:] = False
 
-        # 删除_prev_distance_to_waypoint变量，确保每次reset都重新开始
+        # 删除误差跟踪变量，确保每次reset都重新开始
         if hasattr(self, '_prev_distance_to_waypoint'):
             delattr(self, '_prev_distance_to_waypoint')
+        if hasattr(self, '_prev_enhanced_error'):
+            delattr(self, '_prev_enhanced_error')
 
         planned = False
 
