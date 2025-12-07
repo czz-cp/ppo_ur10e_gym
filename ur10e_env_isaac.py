@@ -206,7 +206,7 @@ class UR10ePPOEnvIsaac:
 
         # 🎯 稳定性跟踪变量
         self.on_goal_count = torch.zeros(num_envs, dtype=torch.long, device=self.device)
-        self.stability_required_steps = 100  # 需要连续100步在目标范围内
+        self.stability_required_steps = 20  # 需要连续100步在目标范围内
         self.target_positions = None
         self.target_joint_angles = None  # 🎯 新增：目标关节角度
         self.prev_position_errors = None
@@ -1066,32 +1066,51 @@ class UR10ePPOEnvIsaac:
             # 懒初始化：采样随机目标姿态
             self.target_orientations = self._sample_random_orientations_batch()
 
-        # 🎯 计算自定义位姿误差向量 error = (Dϕ + Dθ + Dψ, Δθ)
+        # 🎯 按论文附录A.2计算几何位姿误差
         pose_errors = torch.zeros((self.num_envs, 2), device=self.device)
 
+        # 论文参数：轴长度ℓ（0.1m）和姿态权重λ_ori
+        ell = 0.1  # 轴长度
+        lambda_ori = float(self.config.get('trajectory_tracking', {}).get('lambda_ori', 0.5))
+
         for i in range(self.num_envs):
-            # 计算当前和目标位姿的旋转矩阵
+            # 当前位姿：位置p_e, 姿态q_e
+            current_pos = current_positions[i]  # [3]
             current_quat = current_orientations[i]  # [w, x, y, z]
+            current_R = self._quaternion_to_rotation_matrix(current_quat)  # [3, 3]
+
+            # 目标位姿：位置p_t, 姿态q_t
+            target_pos = self.target_positions[i]  # [3]
             target_quat = self.target_orientations[i]  # [w, x, y, z]
+            target_R = self._quaternion_to_rotation_matrix(target_quat)  # [3, 3]
 
-            # 转换为旋转矩阵
-            current_R = self._quaternion_to_rotation_matrix(current_quat)
-            target_R = self._quaternion_to_rotation_matrix(target_quat)
+            # 定义单位向量
+            x_hat = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+            y_hat = torch.tensor([0.0, 1.0, 0.0], device=self.device)
 
-            # 计算三个正交轴上的三点误差 Dϕ + Dθ + Dψ
-            # 使用轴角表示的差值在三个主轴上的投影
-            R_diff = target_R @ current_R.T  # 相对旋转矩阵
-            axis_angle = self._rotation_matrix_to_axis_angle(R_diff)
+            # 当前位姿下的3个点
+            P_e0 = current_pos  # p_e
+            P_e1 = current_pos + current_R @ (ell * x_hat)  # p_e + R_e * ℓ * x̂
+            P_e2 = current_pos + current_R @ (ell * y_hat)  # p_e + R_e * ℓ * ŷ
 
-            # 三个轴上的误差和：|axis_angle_x| + |axis_angle_y| + |axis_angle_z|
-            axis_error_sum = torch.sum(torch.abs(axis_angle))
+            # 目标位姿下的3个点
+            P_t0 = target_pos   # p_t
+            P_t1 = target_pos + target_R @ (ell * x_hat)   # p_t + R_t * ℓ * x̂
+            P_t2 = target_pos + target_R @ (ell * y_hat)   # p_t + R_t * ℓ * ŷ
 
-            # 四元数角差 Δθ
-            quat_angle_diff = self._quaternion_distance(current_quat, target_quat)
+            # 计算几何误差 e_shape = Σ_k ||P_e,k - P_t,k||²
+            shape_error = (torch.norm(P_e0 - P_t0) ** 2 +
+                          torch.norm(P_e1 - P_t1) ** 2 +
+                          torch.norm(P_e2 - P_t2) ** 2)
 
-            # 组合误差向量 (Dϕ + Dθ + Dψ, Δθ)
-            pose_errors[i, 0] = axis_error_sum
-            pose_errors[i, 1] = quat_angle_diff
+            # 计算姿态误差 θ = 2 * arccos(|Δq_w|)
+            delta_q = self._quaternion_multiply(target_quat, self._quaternion_inverse(current_quat))
+            delta_q_w = delta_q[0]  # w分量
+            theta = 2 * torch.arccos(torch.clamp(torch.abs(delta_q_w), 0.0, 1.0))
+
+            # 组合误差向量 e = [e_shape, λ_ori * θ]
+            pose_errors[i, 0] = shape_error
+            pose_errors[i, 1] = lambda_ori * theta
 
         # 🎯 新的状态向量 q_t = [关节角6 + 当前位姿7 + 目标位姿7 + 误差2]
         # 总维度：6 + 7 + 7 + 2 = 22维
@@ -1399,6 +1418,39 @@ class UR10ePPOEnvIsaac:
 
         return distance
 
+    def _quaternion_multiply(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """
+        四元数乘法 q1 ⊗ q2
+
+        Args:
+            q1, q2: 四元数 [w, x, y, z]
+
+        Returns:
+            result: 四元数乘法结果 [w, x, y, z]
+        """
+        w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
+        w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
+
+        w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+        x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+        y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+        z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+
+        return torch.tensor([w, x, y, z], device=q1.device, dtype=q1.dtype)
+
+    def _quaternion_inverse(self, q: torch.Tensor) -> torch.Tensor:
+        """
+        四元数求逆（对于单位四元数等于共轭）
+
+        Args:
+            q: 四元数 [w, x, y, z]
+
+        Returns:
+            inverse: 四元数的逆 [w, x, y, z]
+        """
+        # 对于单位四元数，逆等于共轭 [w, -x, -y, -z]
+        return torch.tensor([q[0], -q[1], -q[2], -q[3]], device=q.device, dtype=q.dtype)
+
     def _quaternion_to_rotation_matrix(self, quat: torch.Tensor) -> torch.Tensor:
         """
         将四元数转换为旋转矩阵
@@ -1691,44 +1743,6 @@ class UR10ePPOEnvIsaac:
             print(f"   力矩张量类型: {all_dof_forces.dtype}")
             print(f"   力矩范数: {torch.norm(all_dof_forces)}")
     
-    def _compute_rewards_batch_(self, actions):
-        """
-        🎯 二次型奖励函数（基于论文设计）
-
-        奖励函数: ρ(e_i, ė_i) = Q_i[1,1]·(e_i)² + Q_i[2,2]·(ė_i)²
-        其中 e_i 是位置误差，ė_i 是速度误差
-        """
-        current_angles, current_vels = self._get_joint_angles_and_velocities()
-
-        # 🎯 关节空间误差计算
-        position_errors = self.target_joint_angles - current_angles  # [num_envs, 6]
-        velocity_errors = -current_vels  # 目标速度为0，所以误差 = -当前速度 [num_envs, 6]
-
-        # 🎯 二次型奖励函数 (论文公式)
-        # ρ(e_i, ė_i) = Q_i[1,1]·(e_i)² + Q_i[2,2]·(ė_i)²
-        position_rewards = -torch.sum(self.Q_weights.unsqueeze(0) * position_errors**2, dim=1)  # [num_envs]
-        velocity_rewards = -torch.sum(self.Q_velocity_weights.unsqueeze(0) * velocity_errors**2, dim=1)  # [num_envs]
-
-        # 总奖励 = 位置奖励 + 速度奖励
-        total_rewards = position_rewards
-        total_rewards = self.reward_scale*total_rewards
-
-        # 📊 调试信息（每100步打印一次）
-        if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
-            avg_position_error = torch.norm(position_errors, dim=1).mean().item()
-            avg_velocity_error = torch.norm(velocity_errors, dim=1).mean().item()
-            avg_reward = total_rewards.mean().item()
-
-            print(f"📈 步骤{self.debug_step}:")
-            print(f"   平均关节位置误差: {avg_position_error:.4f} rad ({avg_position_error*180/3.14159:.1f}°)")
-            #print(f"   平均关节速度误差: {avg_velocity_error:.4f} rad/s")
-            print(f"   平均奖励: {avg_reward:.2f}")
-            print(f"   位置奖励分量: {position_rewards.mean().item():.2f}")
-            #print(f"   速度奖励分量: {velocity_rewards.mean().item():.2f}")
-
-        self.debug_step += 1
-        return total_rewards
-    
     def _compute_rewards_batch(self, actions):
         """
         点到点奖励函数：使用增强误差和对数压缩（与轨迹跟踪环境一致）
@@ -1764,23 +1778,61 @@ class UR10ePPOEnvIsaac:
             )
 
         # 3. 初始化误差跟踪变量（用于进步奖励）
-        if not hasattr(self, "_prev_position_errors"):
-            self._prev_position_errors = torch.full((self.num_envs,), float('inf'), device=self.device)
+        #if not hasattr(self, "_prev_position_errors"):
+        #    self._prev_position_errors = torch.full((self.num_envs,), float('inf'), device=self.device)
 
         # 4. 使用轨迹跟踪环境相同的奖励函数参数
         w1 = self.trajectory_config.get("w1", 0.001) if hasattr(self, 'trajectory_config') else 0.001
-        lambda_ori = self.trajectory_config.get("lambda_ori", 0.5) if hasattr(self, 'trajectory_config') else 0.5
-        tau = self.trajectory_config.get("log_tau", 0.1) if hasattr(self, 'trajectory_config') else 0.1
+        lambda_ori = self.trajectory_config.get("lambda_ori", 0.7) if hasattr(self, 'trajectory_config') else 0.5
+        tau = self.trajectory_config.get("log_tau", 0.0001) if hasattr(self, 'trajectory_config') else 0.1
 
-        # 5. 基于对数压缩的奖励函数（逐个环境计算）
+        # 🎯 5. 使用论文附录A.2的几何位姿误差计算奖励函数
         rewards = torch.zeros(self.num_envs, device=self.device)
 
-        for i in range(self.num_envs):
-            # 综合误差：位置误差 + 姿态误差
-            enhanced_error = position_errors[i] + lambda_ori * orientation_errors[i]
+        # 论文参数：轴长度ℓ（0.1m）
+        ell = 0.1
 
-            # Reward = -[ω1 * e² + ln(e² + τ)]
-            reward_i = -(w1 * enhanced_error**2 + torch.log(1.0 + (enhanced_error**2)/tau))
+        for i in range(self.num_envs):
+            # 当前位姿：位置p_e, 姿态q_e
+            current_pos = current_positions[i]  # [3]
+            current_quat = current_orientations[i]  # [w, x, y, z]
+            current_R = self._quaternion_to_rotation_matrix(current_quat)  # [3, 3]
+
+            # 目标位姿：位置p_t, 姿态q_t
+            target_pos = self.target_positions[i]  # [3]
+            target_quat = self.target_orientations[i]  # [w, x, y, z]
+            target_R = self._quaternion_to_rotation_matrix(target_quat)  # [3, 3]
+
+            # 定义单位向量
+            x_hat = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+            y_hat = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+
+            # 当前位姿下的3个点
+            P_e0 = current_pos  # p_e
+            P_e1 = current_pos + current_R @ (ell * x_hat)  # p_e + R_e * ℓ * x̂
+            P_e2 = current_pos + current_R @ (ell * y_hat)  # p_e + R_e * ℓ * ŷ
+
+            # 目标位姿下的3个点
+            P_t0 = target_pos   # p_t
+            P_t1 = target_pos + target_R @ (ell * x_hat)   # p_t + R_t * ℓ * x̂
+            P_t2 = target_pos + target_R @ (ell * y_hat)   # p_t + R_t * ℓ * ŷ
+
+            # 计算几何误差 e_shape = Σ_k ||P_e,k - P_t,k||²
+            e_shape = (torch.norm(P_e0 - P_t0) ** 2 +
+                       torch.norm(P_e1 - P_t1) ** 2 +
+                       torch.norm(P_e2 - P_t2) ** 2)
+
+            # 计算姿态误差 θ = 2 * arccos(|Δq_w|)
+            delta_q = self._quaternion_multiply(target_quat, self._quaternion_inverse(current_quat))
+            delta_q_w = delta_q[0]  # w分量
+            theta = 2 * torch.arccos(torch.clamp(torch.abs(delta_q_w), 0.0, 1.0))
+
+            # 论文误差向量 e = [e_shape, λ_ori * θ]
+            # 计算误差范数 ||e||² = e_shape² + (λ_ori * θ)²
+            e_norm_squared = e_shape**2 + (lambda_ori * theta)**2
+
+            # 🎯 Reward = -[ω1 * ||e||² + ln(||e||² + τ)]
+            reward_i = -(w1 * e_norm_squared + torch.log(e_norm_squared + tau))
             rewards[i] = reward_i
 
         # 6. 进步奖励：比上一帧更靠近目标就加分
@@ -1804,16 +1856,17 @@ class UR10ePPOEnvIsaac:
         # 9. 应用奖励缩放
         #rewards = self.reward_scale * rewards
 
-        # 10. 调试信息（每100步打印一次）
-        if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
-            avg_error = position_errors.mean().item()
+        # 10. 调试信息（每100步打印一次）- 显示论文误差类型
+        """if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
+            avg_pos_error = position_errors.mean().item()
+            avg_ori_error = orientation_errors.mean().item()
             avg_reward = rewards.mean().item()
-            #success_rate = success.float().mean().item()
 
-            print(f"📈 步骤{self.debug_step}:")
-            print(f"   平均位置误差: {avg_error:.4f} m")
+            print(f"📈 步骤{self.debug_step} (论文A.2几何误差):")
+            print(f"   平均位置误差: {avg_pos_error:.4f} m")
+            print(f"   平均姿态误差: {avg_ori_error:.4f} rad")
             print(f"   平均奖励: {avg_reward:.4f}")
-            #print(f"   成功率: {success_rate:.2%}")
+            print(f"   λ_ori: {lambda_ori:.3f}, τ: {tau:.3f}")"""
 
         return rewards
 

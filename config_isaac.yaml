@@ -126,19 +126,6 @@ trajectory_visualization:
   auto_show_plots: false               # 自动显示图表
   save_interval_episodes: 10        # 每N个episode保存一次图表
 
-# 网络架构配置
-network:
-  # Actor网络
-  actor:
-    hidden_dim: 64               # 隐藏层维度
-    num_layers: 3                # 网络层数
-    activation: "relu"           # 激活函数
-
-  # Critic网络
-  critic:
-    hidden_dim: 64               # 隐藏层维度
-    num_layers: 3                # 网络层数
-    activation: "relu"           # 激活函数
 
 # 价值归一化配置
 value_normalization:
@@ -180,9 +167,9 @@ trajectory_tracking:
   deviation_coef: 2.0            # 路径偏离惩罚系数
   distance_weight: 2.0           # 距离惩罚权重
   progress_weight: 3.0           # 进步奖励权重
-  log_tau: 0.1                  # 对数奖励函数中的τ值
-  w1: 0.0001                      # 位置误差权重
-  lambda_ori: 0.5                # 姿态误差权重
+  log_tau: 0.0001                  # 对数奖励函数中的τ值
+  w1: 0.001                      # 位置误差权重
+  lambda_ori: 0.7                # 姿态误差权重
 
 # 🎯 动作集成（Action Ensembles, AE）配置
 ae:

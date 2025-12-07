@@ -40,15 +40,6 @@ joint_limits:
   - 6.283
   - 6.283
   - 6.283
-network:
-  actor:
-    activation: relu
-    hidden_dim: 64
-    num_layers: 3
-  critic:
-    activation: relu
-    hidden_dim: 64
-    num_layers: 3
 pf:
   enabled: true
   eta_max: 0.99
@@ -143,11 +134,11 @@ trajectory_tracking:
   deviation_coef: 2.0
   distance_weight: 2.0
   lambda_ori: 0.5
-  log_tau: 0.1
+  log_tau: 0.0001
   progress_weight: 3.0
   smooth_coef: 0.1
   use_deviation_penalty: false
-  w1: 0.0001
+  w1: 0.001
   waypoint_bonus: 5.0
   waypoint_threshold: 0.15
 trajectory_visualization:
