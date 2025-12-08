@@ -206,11 +206,14 @@ class UR10ePPOEnvIsaac:
 
         # 🎯 稳定性跟踪变量
         self.on_goal_count = torch.zeros(num_envs, dtype=torch.long, device=self.device)
-        self.stability_required_steps = 20  # 需要连续100步在目标范围内
+        self.stability_required_steps = 5  # 需要连续100步在目标范围内
         self.target_positions = None
         self.target_joint_angles = None  # 🎯 新增：目标关节角度
         self.prev_position_errors = None
         self.prev_joint_errors = None  # 🎯 新增：上次关节角度误差
+
+        # 🔧 修复：显式初始化积分器状态
+        self.desired_joint_angles = None  # PD积分器的期望关节角度
 
         # 🎯 二次型奖励函数参数（基于论文设计）
         # Q矩阵：对角正定矩阵，位置误差权重远大于速度误差权重
@@ -780,7 +783,15 @@ class UR10ePPOEnvIsaac:
             new_orientations = self._sample_random_orientations_batch()[done_indices.cpu().numpy()]
             self.target_orientations[done_indices] = new_orientations
 
-        # 7) 重置对应的奖励归一化器（如果你还在用的话）
+        # 7) 🔧 修复：重置这些环境的desired_joint_angles（关键修复！）
+        if self.desired_joint_angles is not None:
+            # 获取当前所有环境的关节角度
+            current_angles, _ = self._get_joint_angles_and_velocities()
+            # 只重置完成的环境
+            self.desired_joint_angles[done_indices] = current_angles[done_indices]
+            print(f"🔧 Reset {len(done_indices)} 个完成环境的desired_joint_angles为当前角度")
+
+        # 8) 重置对应的奖励归一化器（如果你还在用的话）
         for env_idx in done_indices.cpu().tolist():
             if (0 <= env_idx < len(self.reward_normalizers)
                     and self.reward_normalizers[env_idx] is not None):
