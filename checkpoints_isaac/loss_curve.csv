@@ -1,2 +1,1 @@
 log_step,episode,actor_loss,critic_loss,entropy,mean_return
-0,0,0.468710,1.883881,7.401767,-8.180964

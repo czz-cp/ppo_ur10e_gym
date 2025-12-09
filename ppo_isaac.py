@@ -713,8 +713,13 @@ class PPOIsaac:
         actions = rollouts['actions'].view(-1, self.action_dim)  # [T*N, action_dim]
         old_log_probs = rollouts['log_probs'].view(-1)  # [T*N]
 
-        # 计算价值和优势
-        values = rollouts['values'].view(self.rollout_length, self.num_envs)  # [T, N]
+        # 🔧 修复：计算价值和优势 - GAE需要原始尺度的values
+        values_raw = rollouts['values'].view(self.rollout_length, self.num_envs)  # [T, N] - 原始网络输出
+        # 🔧 保证value_norm存在时才denormalize（稳健性改进）
+        if self.value_norm is not None:
+            values = self.value_norm.denormalize(values_raw)  # 反归一化到原始奖励尺度用于GAE
+        else:
+            values = values_raw
         rewards = rollouts['rewards'].view(self.rollout_length, self.num_envs)  # [T, N]
         dones = rollouts['dones'].view(self.rollout_length, self.num_envs)  # [T, N]
 
@@ -735,7 +740,12 @@ class PPOIsaac:
         # 获取下一个状态的价值
         with torch.no_grad():
             last_next_state = rollouts['next_states'][-1].to(self.device)
-            next_values = self.critic(last_next_state).squeeze(-1)  # [N]
+            next_values_raw = self.critic(last_next_state).squeeze(-1)  # [N] - 原始网络输出
+            # 🔧 保证value_norm存在时才denormalize（稳健性改进）
+            if self.value_norm is not None:
+                next_values = self.value_norm.denormalize(next_values_raw)  # 反归一化到原始奖励尺度
+            else:
+                next_values = next_values_raw
             # 修复：为GAE函数创建正确形状的next_values [T, N]
             next_values_expanded = next_values.unsqueeze(0).expand(self.rollout_length, -1)  # [T, N]
 

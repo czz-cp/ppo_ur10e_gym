@@ -3,8 +3,8 @@
 
 # 环境配置
 env:
-  num_envs: 2                    # 并行环境数量
-  max_steps: 300                 # 增加最大步数，给足够时间完成轨迹
+  num_envs: 1                    # 并行环境数量
+  max_steps: 150                 # 增加最大步数，给足够时间完成轨迹
   device_id: 0                   # GPU设备ID
   dt: 0.01                       # 100Hz，与MuJoCo原始配置一致
 
@@ -136,7 +136,7 @@ value_normalization:
 
 # 奖励归一化配置
 reward_normalization:
-  enabled: true                  # 启用奖励归一化
+  enabled: false                  # 启用奖励归一化
   gamma: 0.99                    # 折扣因子
   clip_range: 5.0                # 归一化值裁剪范围
   warmup_steps: 100              # 热身步数
@@ -173,7 +173,7 @@ trajectory_tracking:
 
 # 🎯 动作集成（Action Ensembles, AE）配置
 ae:
-  enabled: true                  # 启用动作集成
+  enabled: false                  # 启用动作集成
   alpha: 5.0                     # Weibull形状参数增长系数
   beta: 8.0                      # Weibull尺度参数增长系数
   delta_std: 0.1                 # AE标准差（论文建议值）

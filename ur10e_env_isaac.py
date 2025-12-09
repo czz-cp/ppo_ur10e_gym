@@ -87,7 +87,7 @@ class UR10ePPOEnvIsaac:
         self.num_envs = num_envs
 
         # 目标：把单步奖励控制在 [-50, 0] 左右
-        self.reward_scale = 1e-3  # 你可以后面微调，比如 5e-4, 2e-3 之类
+        #self.reward_scale = 1e-3  # 你可以后面微调，比如 5e-4, 2e-3 之类
 
         # 🎯 优先使用传入的device_id，覆盖配置文件中的设置（多GPU服务器兼容）
         self.device_id = device_id

@@ -2,7 +2,7 @@ ae:
   alpha: 5.0
   beta: 8.0
   delta_std: 0.1
-  enabled: true
+  enabled: false
 debug:
   log_level: INFO
   monitor_frequency: 10
@@ -11,8 +11,8 @@ device: cuda:0
 env:
   device_id: 0
   dt: 0.01
-  max_steps: 300
-  num_envs: 2
+  max_steps: 150
+  num_envs: 1
   target_range:
     x:
     - -0.6
@@ -98,7 +98,7 @@ reward:
     weight: 0.1
 reward_normalization:
   clip_range: 5.0
-  enabled: true
+  enabled: false
   gamma: 0.99
   normalize_method: running_stats
   per_env: true
