@@ -1838,12 +1838,12 @@ class UR10ePPOEnvIsaac:
             delta_q_w = delta_q[0]  # w分量
             theta = 2 * torch.arccos(torch.clamp(torch.abs(delta_q_w), 0.0, 1.0))
 
-            # 论文误差向量 e = [e_shape, λ_ori * θ]
-            # 计算误差范数 ||e||² = e_shape² + (λ_ori * θ)²
-            e_norm_squared = e_shape**2 + (lambda_ori * theta)**2
+            # 根据论文(18)：先计算标量误差 e = e_shape + λ_ori * θ
+            e = e_shape + lambda_ori * theta  # 综合位置 + 姿态误差
+            e_sq = e * e  # e²
 
-            # 🎯 Reward = -[ω1 * ||e||² + ln(||e||² + τ)]
-            reward_i = -(w1 * e_norm_squared + torch.log(e_norm_squared + tau))
+            # 🎯 根据论文公式：R(s,a) = -[ω1 * e² + ln(e² + τ)]
+            reward_i = -(w1 * e_sq + torch.log(e_sq + tau))
             rewards[i] = reward_i
 
         # 6. 进步奖励：比上一帧更靠近目标就加分
@@ -1853,16 +1853,17 @@ class UR10ePPOEnvIsaac:
         # 计算进步（正数表示误差变小了）
         progress = prev_errors - position_errors
         progress_reward = progress_weight * torch.clamp(progress, min=0.0)  # 只奖励正向进步
-        rewards += progress_reward
+        rewards += progress_reward"""
 
         # 7. 成功奖励：到达目标位置
         success_threshold = 0.05  # 5cm
+        self.waypoint_bonus = 50.0
         success_bonus = self.waypoint_bonus if hasattr(self, 'waypoint_bonus') else 10.0
         success = position_errors < success_threshold
         rewards += success.float() * success_bonus
 
         # 8. 更新误差跟踪
-        self._prev_position_errors = position_errors.detach()"""
+        #self._prev_position_errors = position_errors.detach()
 
         # 9. 应用奖励缩放
         #rewards = self.reward_scale * rewards

@@ -225,7 +225,7 @@ class ActorNetwork(nn.Module):
             return ensemble_action
 
     def compute_aew_ensemble_size(self, current_episode: int, max_episodes: int,
-                                alpha: float = 5.0, beta: float = 8.0) -> int:
+                                alpha: float = 5.0, beta: float = 8.0, lambda_max: float = None) -> int:
         """
         计算AEW（Weibull Action Ensembles）的采样次数
 
@@ -257,8 +257,9 @@ class ActorNetwork(nn.Module):
         u = torch.rand(1, device=device)
         weibull_sample = lam * (-torch.log(u)).pow(1.0 / k)
 
-        # 裁剪到[1, λ]范围并转为整数
-        ensemble_size = torch.clamp(weibull_sample, 1.0, lam).int().item()
+        # 使用你建议的方法：max(1, round(i))，然后clamp(1, max(lam, lambda_max))
+        max_ensemble = lambda_max if lambda_max is not None else lam
+        ensemble_size = int(torch.clamp(weibull_sample.round(), 1, max_ensemble).item())
 
         return ensemble_size
 
@@ -411,6 +412,7 @@ class PPOIsaac:
         self.ae_enabled = ae_config.get('enabled', False)
         self.ae_alpha = float(ae_config.get('alpha', 5.0))
         self.ae_beta = float(ae_config.get('beta', 8.0))
+        self.ae_lambda_max = int(ae_config.get('lambda_max', 10))  # 最大集成大小
         self.ae_delta_std = float(ae_config.get('delta_std', 0.1))
         self.current_ensemble_size = 1  # 默认采样次数
 
@@ -456,7 +458,7 @@ class PPOIsaac:
         # 🎯 显示AE���PF状态
         print(f"   🎯 动作集成(AE): {'启用' if self.ae_enabled else '禁用'}")
         if self.ae_enabled:
-            print(f"      Alpha: {self.ae_alpha}, Beta: {self.ae_beta}, Delta_std: {self.ae_delta_std}")
+            print(f"      Alpha: {self.ae_alpha}, Beta: {self.ae_beta}, Lambda_max: {self.ae_lambda_max}, Delta_std: {self.ae_delta_std}")
         print(f"   🎯 策略反馈(PF): {'启用' if self.pf_enabled else '禁用'}")
         if self.pf_enabled:
             print(f"      Eta范围: [{self.pf_eta_min}, {self.pf_eta_max}]")
@@ -473,7 +475,8 @@ class PPOIsaac:
                 current_episode=self.episode_count,
                 max_episodes=self.num_episodes,
                 alpha=self.ae_alpha,
-                beta=self.ae_beta
+                beta=self.ae_beta,
+                lambda_max=self.ae_lambda_max
             )
 
     def _test_gradient_flow(self):
@@ -829,6 +832,8 @@ class PPOIsaac:
 
                 # 熵正则化
                 entropy = dist.entropy().sum(dim=-1).mean()
+                # 把熵打包进 actor_loss
+                actor_total_loss = actor_loss - self.entropy_coef * entropy
 
                 # Critic损失
                 batch_values = self.critic(batch_states).squeeze(-1).float()
@@ -860,7 +865,7 @@ class PPOIsaac:
                 self.actor_optimizer.zero_grad()
 
                 try:
-                    actor_loss.backward(retain_graph=True)
+                    actor_total_loss.backward(retain_graph=True)
 
                     # 检查actor梯度
                     if hasattr(self, '_debug_mode') and self._debug_mode:

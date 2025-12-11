@@ -4,7 +4,7 @@
 # 环境配置
 env:
   num_envs: 1                    # 并行环境数量
-  max_steps: 150                 # 增加最大步数，给足够时间完成轨迹
+  max_steps: 100                 # 增加最大步数，给足够时间完成轨迹
   device_id: 0                   # GPU设备ID
   dt: 0.01                       # 100Hz，与MuJoCo原始配置一致
 
@@ -17,7 +17,7 @@ env:
 
 # 🎯 设备配置（参考isaac_gym_manipulator方案）
 device: "cuda:0"                 # PyTorch设备 (用户服务器使用GPU 2)
-sim:
+simulator:
   device_id: 0                  # Isaac Gym仿真设备ID (用户服务器使用GPU 2)
   # 物理引擎配置（基于isaac_gym_manipulator成功配置）
   solver_type: 1                 # 使用solver_type=1
@@ -49,7 +49,7 @@ ppo:
   lam: 0.95                      # GAE λ参数保持不变
 
   # 正则化（增加探索）
-  entropy_coef: 0.01             # 增加熵系数，鼓励更多探索
+  entropy_coef: 0.002             # 增加熵系数，鼓励更多探索
   value_coef: 0.5                # 价值函数系数保持不变
 
   # 梯度处理
@@ -57,7 +57,7 @@ ppo:
 
 # 训���配置（优化rollout策略）
 train:
-  rollout_length: 512           # 降低rollout长度，更适合500步episode
+  rollout_length: 256           # 降低rollout长度，更适合500步episode
   batch_size: 64                 # 批次大小
   num_updates: 10                # 每次收集后更新次数
   num_episodes: 10000            # 总训练回合数
@@ -173,14 +173,16 @@ trajectory_tracking:
 
 # 🎯 动作集成（Action Ensembles, AE）配置
 ae:
-  enabled: false                  # 启用动作集成
+  enabled: true                  # 启用动作集成
   alpha: 5.0                     # Weibull形状参数增长系数
-  beta: 8.0                      # Weibull尺度参数增长系数
+  beta: 3.0                      # Weibull尺度参数增长系数
   delta_std: 0.1                 # AE标准差（论文建议值）
+  lambda_max: 3
+
 
 # 🎯 策略反馈（Policy Feedback, PF）配置
 pf:
-  enabled: true                  # 启用策略反馈
+  enabled: false                  # 启用策略反馈
   eta_min: 0.6                   # 最小折扣因子
   eta_max: 0.99                  # 最大折扣因子
 

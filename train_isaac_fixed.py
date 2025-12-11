@@ -146,7 +146,7 @@ def test_training_components():
         from ppo_isaac import PPOIsaac
 
         # 创建简单的PPO配置
-        config = get_default_config_isaac()
+        config = load_config_isaac()
 
         print("✅ PPO模块导入成功")
         print(f"   Actor学习率: {config['ppo']['lr_actor']}")
