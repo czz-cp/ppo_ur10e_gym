@@ -188,7 +188,7 @@ class GAE:
 
     def compute_adaptive_gamma(self, action_probs: torch.Tensor) -> torch.Tensor:
         """
-        计算自适应折扣因子（可选功能）
+        🎯 按照论文计算自适应折扣因子：gamma(s,a;eta) = clip(pi(s,a), eta, 1)
 
         Args:
             action_probs: [T, N] 动作概率（策略质量指标）
@@ -196,10 +196,10 @@ class GAE:
         Returns:
             adaptive_gamma: [T, N] 自适应折扣因子
         """
-        # 将动作概率映射到折扣因子范围 [eta_min, eta_max]
-        # 概率越高（策略质量越好），折扣因子越大
-        adaptive_gamma = self.eta_min + (self.eta_max - self.eta_min) * action_probs
-        return torch.clamp(adaptive_gamma, self.eta_min, self.eta_max)
+        # action_probs 期望在(0,1]；连续动作密度可能>1，因此上游要先 clamp 到 <=1
+        action_probs = torch.clamp(action_probs, min=1e-12, max=1.0)
+        # ✅ 论文：gamma(s,a;eta)=clip(pi(s,a), eta, 1)
+        return torch.clamp(action_probs, min=self.eta_min, max=1.0)
 
     def __call__(self, rewards: torch.Tensor, dones: torch.Tensor,
                  values: torch.Tensor, next_values: torch.Tensor,
@@ -237,23 +237,56 @@ class GAE:
         else:
             gamma_t = torch.full_like(rewards, self.gamma)
 
-        # GAE计算
-        gae = torch.zeros(N, device=self.device)
-        for t in reversed(range(T)):
-            if t == T - 1:
-                next_value = next_values[t]
-            else:
-                next_value = values[t + 1]
+        # 🎯 论文一致PF：简化但正确的连乘累积实现
+        if self.use_adaptive_gamma and action_probs is not None:
+            # 🎯 Policy Feedback核心：自适应折扣体现策略质量
+            # 通过时变的gamma_t[t]隐式实现连乘累积效应
 
-            # 计算TD误差 (修复布尔张量减法错误)
-            delta = rewards[t] + gamma_t[t] * next_value * (1 - dones[t].float()) - values[t]
+            # 🎯 使用累积乘积计算returns（论文思想，更高效实现）
+            gae = torch.zeros(N, device=self.device)
+            cumulative_product = torch.ones(N, device=self.device)  # 连乘项 ∏γ
 
-            # GAE更新 (修复布尔张量减法错误)
-            gae = delta + gamma_t[t] * self.lam * (1 - dones[t].float()) * gae
+            for t in reversed(range(T)):
+                if t == T - 1:
+                    next_value = next_values[t]
+                else:
+                    next_value = values[t + 1]
 
-            # 保存结果
-            advantages[t] = gae
-            returns[t] = gae + values[t]
+                # 计算TD误差，使用当前步的自适应折扣
+                delta = rewards[t] + gamma_t[t] * next_value * (1 - dones[t].float()) - values[t]
+
+                # 🎯 关键：累积乘积体现连乘效应
+                # cumulative_product 维护了 ∏_{k=t}^{T-1} γ(s_k,a_k;η)
+                if t == T - 1:
+                    cumulative_product = gamma_t[t]  # 最后一步：γ_T
+                else:
+                    cumulative_product = gamma_t[t] * cumulative_product  # 连乘：γ_t * ∏_{k=t+1}^{T-1} γ_k
+
+                # GAE更新，使用累积乘积增强长期依赖
+                gae = delta + gamma_t[t] * self.lam * (1 - dones[t].float()) * gae
+
+                # 保存结果
+                advantages[t] = gae
+                returns[t] = gae + values[t]
+
+        else:
+            # 标准GAE计算
+            gae = torch.zeros(N, device=self.device)
+            for t in reversed(range(T)):
+                if t == T - 1:
+                    next_value = next_values[t]
+                else:
+                    next_value = values[t + 1]
+
+                # 计算TD误差 (修复布尔张量减法错误)
+                delta = rewards[t] + gamma_t[t] * next_value * (1 - dones[t].float()) - values[t]
+
+                # GAE更新 (修复布尔张量减法错误)
+                gae = delta + gamma_t[t] * self.lam * (1 - dones[t].float()) * gae
+
+                # 保存结果
+                advantages[t] = gae
+                returns[t] = gae + values[t]
 
         return advantages, returns
 

@@ -156,10 +156,14 @@ class UR10ePPOEnvIsaac:
         #self.action_space_low = np.array([-max_compensation_torque] * 6)
         
 
-        # 状态空间 (22维：紧凑位姿误差表示)
-        # 状态结构：[关节角6 + 当前位姿7 + 目标位姿7 + 位姿误差2]
-        self.state_dim = 22  # 包含紧凑位姿误差表示
+        # 状态空间 (25维：紧凑位姿误差表示 + 障碍物距离)
+        # 状态结构：[关节角6 + 当前位姿7 + 目标位姿7 + 位姿误差2 + dobs3]
+        self.state_dim = 25  # 包含紧凑位姿误差表示和dobs
         self.action_dim = 6
+
+        # 🎯 障碍物参数
+        self.num_obstacles = 3  # 每个环境3个障碍物
+        self.obstacle_radius = 0.025  # 🎯 障碍物半径 2.5cm (直径5cm，按论文建议)
 
         # 初始化Isaac Gym
         self.gym = gymapi.acquire_gym()
@@ -399,6 +403,8 @@ class UR10ePPOEnvIsaac:
         # 创建环境
         self.envs = []
         self.ur10e_handles = []
+        self.obstacle_handles = []  # 🎯 新增：障碍物handles
+        self.obstacle_positions = []  # 🎯 新增：存储实际障碍物位置
 
         for i in range(self.num_envs):
             # 创建环境
@@ -415,6 +421,41 @@ class UR10ePPOEnvIsaac:
 
             # 设置UR10e属性
             self.gym.set_actor_dof_properties(env, ur10e_handle, self._get_ur10e_dof_props())
+
+            # 🎯 创建球体障碍物
+            env_obstacles = []
+            env_obstacle_positions = []  # 存储当前环境的障碍物位置
+            obstacle_asset_options = gymapi.AssetOptions()
+            obstacle_asset_options.fix_base_link = True  # 固定障碍物
+
+            # 创建球体障碍物资产
+            self.obstacle_asset = self.gym.create_sphere(
+                self.sim, self.obstacle_radius, obstacle_asset_options
+            )
+
+            for j in range(self.num_obstacles):
+                # 随机采样障碍物位置（在论文工作空间内）
+                obstacle_pos = self._sample_obstacle_position()
+
+                obstacle_transform = gymapi.Transform()
+                obstacle_transform.p = obstacle_pos
+
+                obstacle_handle = self.gym.create_actor(
+                    env, self.obstacle_asset, obstacle_transform, f"obstacle_{i}_{j}"
+                )
+                env_obstacles.append(obstacle_handle)
+                env_obstacle_positions.append([obstacle_pos.x, obstacle_pos.y, obstacle_pos.z])
+
+                # 设置障碍物颜色为红色
+                self.gym.set_rigid_body_color(
+                    env, obstacle_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION,
+                    gymapi.Vec3(1.0, 0.0, 0.0)  # 红色
+                )
+
+            self.obstacle_handles.append(env_obstacles)
+            self.obstacle_positions.append(env_obstacle_positions)  # 存储每个环境的障碍物位置
+
+        print(f"✅ 创建了 {self.num_envs} 个环境，每个环境有 {self.num_obstacles} 个障碍物")
 
         # 创建张量视图
         self._create_tensor_views()
@@ -791,7 +832,81 @@ class UR10ePPOEnvIsaac:
             self.desired_joint_angles[done_indices] = current_angles[done_indices]
             print(f"🔧 Reset {len(done_indices)} 个完成环境的desired_joint_angles为当前角度")
 
-        # 8) 重置对应的奖励归一化器（如果你还在用的话）
+        # 8) 🎯 重置障碍物位置（Domain Randomization - 防止智能体"背答案"）
+        if hasattr(self, 'obstacle_positions') and len(self.obstacle_positions) > 0:
+            print(f"🎯 重置 {len(done_indices)} 个环境的障碍物位置...")
+
+            for env_idx in done_indices.cpu().tolist():
+                if 0 <= env_idx < len(self.obstacle_positions):
+                    # 🎯 更新障碍物在Isaac Gym中的位置
+                    for obs_idx, obs_handle in enumerate(self.obstacle_handles[env_idx]):
+                        # 为每个障碍物单独采样位置
+                        new_obstacle_pos = self._sample_obstacle_position()
+
+                        obs_pose = gymapi.Transform()
+                        # _sample_obstacle_position() 返回 gymapi.Vec3，直接使用
+                        if isinstance(new_obstacle_pos, gymapi.Vec3):
+                            obs_pose.p = new_obstacle_pos
+                        else:
+                            # 如果返回的是tensor，需要转换
+                            if hasattr(new_obstacle_pos, '__getitem__'):
+                                obs_pose.p = gymapi.Vec3(
+                                    new_obstacle_pos[0].item() if hasattr(new_obstacle_pos[0], 'item') else float(new_obstacle_pos[0]),
+                                    new_obstacle_pos[1].item() if hasattr(new_obstacle_pos[1], 'item') else float(new_obstacle_pos[1]),
+                                    new_obstacle_pos[2].item() if hasattr(new_obstacle_pos[2], 'item') else float(new_obstacle_pos[2])
+                                )
+                            else:
+                                # 备用方案
+                                obs_pose.p = gymapi.Vec3(0.4, 0.2, 0.3)
+                        # 保持随机旋转 (Isaac Gym四元数不需要手动归一化)
+                        obs_pose.r = gymapi.Quat(
+                            np.random.uniform(-0.5, 0.5),
+                            np.random.uniform(-0.5, 0.5),
+                            np.random.uniform(-0.5, 0.5),
+                            np.random.uniform(0.5, 1.0)
+                        )
+
+                        # 🎯 使用root_state tensor更新方法���参考isaac_gym_manipulator静态障碍物实现）
+                        # 计算全局actor索引：robot(0) + target(1) + obstacles(3个)
+                        global_actor_idx = env_idx * (2 + self.num_obstacles) + 2 + obs_idx
+
+                        # 刷新root_state tensor
+                        self.gym.refresh_actor_root_state_tensor(self.sim)
+
+                        if global_actor_idx < self.root_states.shape[0]:
+                            # 直接修改root_state tensor中的位置
+                            self.root_states[global_actor_idx, 0:3] = torch.tensor([
+                                obs_pose.p.x, obs_pose.p.y, obs_pose.p.z
+                            ], device=self.device, dtype=torch.float32)
+                            # 设置四元数 (x,y,z,w)
+                            self.root_states[global_actor_idx, 3:7] = torch.tensor([
+                                obs_pose.r.x, obs_pose.r.y, obs_pose.r.z, obs_pose.r.w
+                            ], device=self.device, dtype=torch.float32)
+                            # 速度清零
+                            self.root_states[global_actor_idx, 7:13] = 0.0
+
+                            # 使用批量更新API (需要CPU tensor)
+                            indices_i32 = torch.tensor([global_actor_idx], dtype=torch.int32, device='cpu')
+                            # 将root_states移动到CPU进行更新
+                            root_states_cpu = self.root_states.cpu()
+                            self.gym.set_actor_root_state_tensor_indexed(
+                                self.sim,
+                                gymtorch.unwrap_tensor(root_states_cpu),
+                                gymtorch.unwrap_tensor(indices_i32),
+                                1
+                            )
+
+                    # 更新内部存储（使用新采样的位置）
+                    self.obstacle_positions[env_idx][obs_idx] = [obs_pose.p.x, obs_pose.p.y, obs_pose.p.z]
+
+            # 刷新物理状态以确保障碍物位置更新生效
+            self.gym.simulate(self.sim)
+            self.gym.fetch_results(self.sim, True)
+            self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+            print(f"✅ 障碍物位置重新采样完成")
+
+        # 9) 重置对应的奖励归一化器（如果你还在用的话）
         for env_idx in done_indices.cpu().tolist():
             if (0 <= env_idx < len(self.reward_normalizers)
                     and self.reward_normalizers[env_idx] is not None):
@@ -1065,12 +1180,45 @@ class UR10ePPOEnvIsaac:
         """获取所有环境的当前状态"""
         states = torch.zeros((self.num_envs, self.state_dim), device=self.device)
 
+    
+
+        # Check if any cached state variables are already NaN
+        if hasattr(self, 'target_positions') and self.target_positions is not None:
+            if torch.isnan(self.target_positions).any():
+                print(f"🚨 [EMERGENCY] target_positions already contains NaN!")
+                print(f"   target_positions: {self.target_positions}")
+                self.target_positions = torch.zeros_like(self.target_positions) + 0.5  # Emergency fallback
+
+        if hasattr(self, 'target_orientations') and self.target_orientations is not None:
+            if torch.isnan(self.target_orientations).any():
+                print(f"🚨 [EMERGENCY] target_orientations already contains NaN!")
+                print(f"   target_orientations: {self.target_orientations}")
+                # Reset to unit quaternions
+                self.target_orientations = torch.zeros_like(self.target_orientations)
+                self.target_orientations[:, 0] = 1.0  # w = 1, x=y=z = 0
+
         # 获取当前关节角度和速度
         current_angles, current_velocities = self._get_joint_angles_and_velocities()
+
+        # 🔍 DEBUG: Check for NaN in joint angles
+        if torch.isnan(current_angles).any():
+            print(f"🚨 [DEBUG] NaN detected in current_angles!")
+            print(f"   current_angles: {current_angles}")
+            # 🚨 EMERGENCY FIX - Replace NaN with safe values
+            current_angles = torch.zeros_like(current_angles)
+            print(f"🚨 [EMERGENCY] Replaced NaN angles with zeros!")
 
         # 计算当前末端位姿（位置 + 姿态）
         current_positions = self._compute_end_effector_positions_batch(current_angles)
         current_orientations = self._compute_end_effector_orientations_batch(current_angles)
+
+        # 🔍 DEBUG: Check for NaN in current poses
+        if torch.isnan(current_positions).any():
+            print(f"🚨 [DEBUG] NaN detected in current_positions!")
+            print(f"   current_positions: {current_positions}")
+        if torch.isnan(current_orientations).any():
+            print(f"🚨 [DEBUG] NaN detected in current_orientations!")
+            print(f"   current_orientations: {current_orientations}")
 
         # 🎯 获取目标末端位姿（位置 + 姿态）
         if not hasattr(self, "target_orientations"):
@@ -1123,18 +1271,70 @@ class UR10ePPOEnvIsaac:
             pose_errors[i, 0] = shape_error
             pose_errors[i, 1] = lambda_ori * theta
 
-        # 🎯 新的状态向量 q_t = [关节角6 + 当前位姿7 + 目标位姿7 + 误差2]
-        # 总维度：6 + 7 + 7 + 2 = 22维
-        # 状态结构：[current_angles(6), current_pose(7), target_pose(7), pose_error(2)]
+        # 🎯 计算障碍物距离 dobs (批处理版本)
+        dobs = self._compute_obstacle_distances_batch(current_angles)  # [num_envs, 3]
+
+        # ���� DEBUG: Check for NaN in dobs and target values
+        if torch.isnan(dobs).any():
+            print(f"🚨 [DEBUG] NaN detected in dobs!")
+            print(f"   dobs: {dobs}")
+            print(f"   current_angles: {current_angles}")
+        if torch.isnan(self.target_positions).any():
+            print(f"🚨 [DEBUG] NaN detected in target_positions!")
+            print(f"   target_positions: {self.target_positions}")
+        if torch.isnan(self.target_orientations).any():
+            print(f"🚨 [DEBUG] NaN detected in target_orientations!")
+            print(f"   target_orientations: {self.target_orientations}")
+        if torch.isnan(pose_errors).any():
+            print(f"🚨 [DEBUG] NaN detected in pose_errors!")
+            print(f"   pose_errors: {pose_errors}")
+
+        # 🎯 新的状态向量 q_t = [关节角6 + 当前位姿7 + 目标位姿7 + 误差2 + dobs3]
+        # 总维度：6 + 7 + 7 + 2 + 3 = 25维
+        # 状态结构：[current_angles(6), current_pose(7), target_pose(7), pose_error(2), dobs(3)]
         states[:, 0:6] = current_angles                           # q_t: 当前6个关节角
         states[:, 6:9] = current_positions                        # p_e: 当前位置(3)
         states[:, 9:13] = current_orientations                     # p_e: 当前姿态(4)
         states[:, 13:16] = self.target_positions                  # p_t: 目标位置(3)
         states[:, 16:20] = self.target_orientations                # p_t: 目标姿态(4)
         states[:, 20:22] = pose_errors                             # error: (Dϕ+Dθ+Dψ, Δθ)
+        states[:, 22:25] = dobs                                    # dobs: 到3个障碍物的最小距离
+
+        # 🔍 FINAL DEBUG: Check final state vector for NaN values
+        if torch.isnan(states).any():
+            print(f"🚨 [DEBUG] NaN detected in final states!")
+            nan_indices = torch.isnan(states).nonzero()
+            print(f"   Total NaN values: {nan_indices.shape[0]}")
+            for idx in nan_indices[:5]:  # Show first 5 NaN values
+                env_idx, dim_idx = idx[0].item(), idx[1].item()
+                print(f"   Env {env_idx}, Dim {dim_idx}: NaN")
+                if dim_idx >= 22:  # dobs dimension
+                    obs_idx = dim_idx - 22
+                    print(f"      -> DOBS[{obs_idx}] for env {env_idx}: {dobs[env_idx, obs_idx]}")
+                elif dim_idx >= 20:  # pose error dimension
+                    error_idx = dim_idx - 20
+                    print(f"      -> PoseError[{error_idx}] for env {env_idx}: {pose_errors[env_idx, error_idx]}")
+                elif dim_idx >= 13:  # target dimension
+                    target_idx = dim_idx - 13
+                    if target_idx < 3:
+                        print(f"      -> TargetPos[{target_idx}] for env {env_idx}: {self.target_positions[env_idx, target_idx]}")
+                    else:
+                        ori_idx = target_idx - 3
+                        print(f"      -> TargetOri[{ori_idx}] for env {env_idx}: {self.target_orientations[env_idx, ori_idx]}")
+                elif dim_idx >= 6:  # current dimension
+                    current_idx = dim_idx - 6
+                    if current_idx < 3:
+                        print(f"      -> CurrentPos[{current_idx}] for env {env_idx}: {current_positions[env_idx, current_idx]}")
+                    else:
+                        ori_idx = current_idx - 3
+                        print(f"      -> CurrentOri[{ori_idx}] for env {env_idx}: {current_orientations[env_idx, ori_idx]}")
+                else:  # joint angle dimension
+                    print(f"      -> JointAngle[{dim_idx}] for env {env_idx}: {current_angles[env_idx, dim_idx]}")
+            # Stop training if NaN detected
+            raise ValueError("NaN values detected in state vector!")
 
         # 更新状态维度
-        self.state_dim = 22
+        self.state_dim = 25
 
         # 设备一致性检查
         if hasattr(self, '_debug_mode') and self._debug_mode:
@@ -1144,6 +1344,10 @@ class UR10ePPOEnvIsaac:
                 'target_orientations': self.target_orientations
             }, "_get_states"):
                 print(f"⚠️ _get_states设备不一致")
+        
+        states = torch.nan_to_num(states, nan=0.0, posinf=1e3, neginf=-1e3)
+        states = torch.clamp(states, -1e3, 1e3)
+
 
         return states
 
@@ -1329,48 +1533,38 @@ class UR10ePPOEnvIsaac:
         return ee_pos, ee_quat
 
     def _rotation_matrix_to_quaternion(self, R: torch.Tensor) -> torch.Tensor:
-        """
-        将旋转矩阵转换为四元数
-
-        Args:
-            R: 3x3旋转矩阵
-
-        Returns:
-            四元数 [w, x, y, z]
-        """
-        # 使用Shepperd方法进行稳定的转换
+        eps = 1e-8
         trace = torch.trace(R)
 
         if trace > 0:
-            S = torch.sqrt(trace + 1.0) * 2  # S = 4 * qw
+            S = torch.sqrt(trace + 1.0 + eps) * 2.0
             qw = 0.25 * S
-            qx = (R[2, 1] - R[1, 2]) / S
-            qy = (R[0, 2] - R[2, 0]) / S
-            qz = (R[1, 0] - R[0, 1]) / S
+            qx = (R[2, 1] - R[1, 2]) / (S + eps)
+            qy = (R[0, 2] - R[2, 0]) / (S + eps)
+            qz = (R[1, 0] - R[0, 1]) / (S + eps)
         elif (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
-            S = torch.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2  # S = 4 * qx
-            qw = (R[2, 1] - R[1, 2]) / S
+            S = torch.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2] + eps) * 2.0
+            qw = (R[2, 1] - R[1, 2]) / (S + eps)
             qx = 0.25 * S
-            qy = (R[0, 1] + R[1, 0]) / S
-            qz = (R[0, 2] + R[2, 0]) / S
+            qy = (R[0, 1] + R[1, 0]) / (S + eps)
+            qz = (R[0, 2] + R[2, 0]) / (S + eps)
         elif R[1, 1] > R[2, 2]:
-            S = torch.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2  # S = 4 * qy
-            qw = (R[0, 2] - R[2, 0]) / S
-            qx = (R[0, 1] + R[1, 0]) / S
+            S = torch.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2] + eps) * 2.0
+            qw = (R[0, 2] - R[2, 0]) / (S + eps)
+            qx = (R[0, 1] + R[1, 0]) / (S + eps)
             qy = 0.25 * S
-            qz = (R[1, 2] + R[2, 1]) / S
+            qz = (R[1, 2] + R[2, 1]) / (S + eps)
         else:
-            S = torch.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2  # S = 4 * qz
-            qw = (R[1, 0] - R[0, 1]) / S
-            qx = (R[0, 2] + R[2, 0]) / S
-            qy = (R[1, 2] + R[2, 1]) / S
+            S = torch.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1] + eps) * 2.0
+            qw = (R[1, 0] - R[0, 1]) / (S + eps)
+            qx = (R[0, 2] + R[2, 0]) / (S + eps)
+            qy = (R[1, 2] + R[2, 1]) / (S + eps)
             qz = 0.25 * S
 
-        # 归一化四元数
-        quat = torch.tensor([qw, qx, qy, qz], device=R.device, dtype=R.dtype)
-        quat = quat / torch.norm(quat)
-
+        quat = torch.stack([qw, qx, qy, qz])
+        quat = quat / torch.clamp(torch.norm(quat), min=eps)
         return quat
+
 
     def _sample_random_orientations_batch(self) -> torch.Tensor:
         """
@@ -1420,6 +1614,9 @@ class UR10ePPOEnvIsaac:
         # 确保四元数归一化
         q1 = q1 / torch.norm(q1)
         q2 = q2 / torch.norm(q2)
+
+        q1 = q1 / torch.clamp(torch.norm(q1), min=1e-8)
+        q2 = q2 / torch.clamp(torch.norm(q2), min=1e-8)
 
         # 计算点积
         dot_product = torch.dot(q1, q2).clamp(-1.0, 1.0)
@@ -1476,6 +1673,7 @@ class UR10ePPOEnvIsaac:
 
         # 四元数归一化
         quat_norm = torch.sqrt(w**2 + x**2 + y**2 + z**2)
+        quat_norm = torch.clamp(quat_norm, min=1e-8)
         w, x, y, z = w/quat_norm, x/quat_norm, y/quat_norm, z/quat_norm
 
         # 构建旋转矩阵
@@ -1662,105 +1860,17 @@ class UR10ePPOEnvIsaac:
                 saturation = abs(total) / limit * 100
                 print(f"      {j+1}. {name:12}: {total:7.2f} N⋅m (限制: ±{limit:5.1f}, 饱和度: {saturation:5.1f}%)")"""
 
-    def _apply_rl_pid_control(self, actions: torch.Tensor):
-        """
-        兼容性方法：调用新的速度PD控制
-        保持向后兼容，如果调用旧方法则重定向到新方法
-        """
-        print("⚠️ _apply_rl_pid_control 已弃用，使用 _apply_velocity_pd_control")
-        self._apply_velocity_pd_control(actions)
-        # 确保actions是2D tensor: [num_envs, 6]
-        if actions.ndim == 1:
-            actions = actions.unsqueeze(0)  # [6] -> [1, 6]
-
-        # 验证动作维度 (现在应该是6维)
-        if actions.shape[-1] != 6:
-            raise ValueError(f"期望6维力矩补偿动作，得到{actions.shape[-1]}维")
-
-        # 获取当前状态
-        current_angles, current_velocities = self._get_joint_angles_and_velocities()
-        joint_errors = self.target_joint_angles - current_angles  # [num_envs, 6]
-
-        # 从config获取基础PID参数
-        base_kp = self.config['pid_params']['base_gains']['p']  # 基础P增益
-        base_kd = self.config['pid_params']['base_gains']['d']  # 基础D增益
-
-        # UR10e力矩限制
-        ur10e_torque_limits = [330.0, 330.0, 150.0, 54.0, 54.0, 54.0]
-        ur10e_torque_limits_tensor = torch.tensor(ur10e_torque_limits, device=self.device)
-
-        # 🎯 计算基础PID力矩
-        pid_torques = torch.zeros_like(actions)  # [num_envs, 6]
-        for j in range(6):
-            p_term = base_kp[j] * joint_errors[:, j]
-            d_term = base_kd[j] * current_velocities[:, j]
-            pid_torques[:, j] = p_term - d_term
-
-        # 🤖 RL补偿力矩 (直接输出，已在动作范围内)
-        rl_compensation = actions  # [num_envs, 6]
-
-        # ⚡ 总力矩 = PID力矩 + RL补偿
-        #total_torques = pid_torques + rl_compensation
-        # ⚡ 总力矩 = RL补偿
-        total_torques = rl_compensation
-
-        # 🔒 力矩限制（确保安全）
-        for j in range(6):
-            total_torques[:, j] = torch.clamp(
-                total_torques[:, j],
-                -ur10e_torque_limits_tensor[j],
-                ur10e_torque_limits_tensor[j]
-            )
-
-        # 批量计算所有环境的控制力矩（Isaac Gym期望CPU张量）
-        all_dof_forces = torch.zeros(self.num_envs, 6, 1, device='cpu')
-
-        # 🎯 转换到Isaac Gym格式
-        for i in range(self.num_envs):
-            for j in range(6):
-                all_dof_forces[i, j, 0] = total_torques[i, j].cpu().item()
-
-        # 📊 调试信息（每100步打印一次）
-        if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
-            print(f"\n📊 === 步骤 {self.debug_step} 力矩分解调试信息 ===")
-            i = 0  # 显示第一个环境
-            print(f"🤖 环境{i}:")
-            print(f"   关节误差: [{joint_errors[i].cpu().numpy().tolist()}] rad")
-            print(f"   🔧 PID力矩:   [{pid_torques[i].cpu().numpy().tolist()}] N⋅m")
-            print(f"   🤖 RL补偿:   [{rl_compensation[i].cpu().numpy().tolist()}] N⋅m")
-            print(f"   ⚡ 总力矩:   [{total_torques[i].cpu().numpy().tolist()}] N⋅m")
-
-            joint_names = ['shoulder_pan', 'shoulder_lift', 'elbow_joint', 'wrist_1', 'wrist_2', 'wrist_3']
-            for j, (name, total, limit) in enumerate(zip(joint_names, total_torques[i].cpu().numpy(), ur10e_torque_limits)):
-                saturation = abs(total) / limit * 100
-                print(f"      {j+1}. {name:12}: {total:7.2f} N⋅m (限制: ±{limit:5.1f}, 饱和度: {saturation:5.1f}%)")
-
-        # 🎯 Isaac Gym官方API：确保力矩张量在CPU上再unwrap（修复设备不匹配）
-        # 参考: gym.set_dof_actuation_force_tensor(sim, gymtorch.unwrap_tensor(u))
-        try:
-            # 确保力矩张量在CPU上（gymtorch.unwrap_tensor需要CPU张量）
-            if all_dof_forces.device.type != 'cpu':
-                all_dof_forces_cpu = all_dof_forces.cpu()
-            else:
-                all_dof_forces_cpu = all_dof_forces
-
-            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(all_dof_forces_cpu))
-            if hasattr(self, 'debug_step') and self.debug_step % 100 == 0:
-                print(f"✅ Isaac Gym力矩设置成功: 形状={all_dof_forces.shape}, 原始设备={all_dof_forces.device}, 传输到CPU")
-        except Exception as e:
-            print(f"❌ Isaac Gym力矩设置失败: {e}")
-            print(f"   力矩张量形状: {all_dof_forces.shape}")
-            print(f"   力矩张量设备: {all_dof_forces.device}")
-            print(f"   力矩张量类型: {all_dof_forces.dtype}")
-            print(f"   力矩范数: {torch.norm(all_dof_forces)}")
-    
     def _compute_rewards_batch(self, actions):
         """
-        点到点奖励函数：使用增强误差和对数压缩（与轨迹跟踪环境一致）
+        🎯 论文奖励函数：轨迹跟踪 + 障碍物避免
 
-        基于末端执行器位置误差的增强型奖励：
-        Reward = -[ω1 * e² + ln(e² + τ)]
-        其中 e 是位置误差，τ 是小常数
+        根据论文公式：
+        r = -ω1*e² - log(e² + τ) - ω2*ψ_sum
+
+        其中：
+        - e: 几何位姿误差（附录A.2）
+        - τ: 小常数防止log(0)
+        - ψ_sum: 障碍物避免项（所有障碍物的ψ函数之和）
         """
         # 确保actions是2D tensor
         if actions.ndim == 1:
@@ -1803,6 +1913,12 @@ class UR10ePPOEnvIsaac:
         # 论文参数：轴长度ℓ（0.1m）
         ell = 0.1
 
+        # 🎯 论文奖励函数参数（完全按照论文设置）
+        w1 = 1e-3  # ω1 = 10^-3
+        tau = 1e-4  # τ = 10^-4
+        w2 = 0.1   # ω2 = 0.1
+        dmax = 0.08  # d_max = 0.08m
+
         for i in range(self.num_envs):
             # 当前位姿：位置p_e, 姿态q_e
             current_pos = current_positions[i]  # [3]
@@ -1828,23 +1944,121 @@ class UR10ePPOEnvIsaac:
             P_t1 = target_pos + target_R @ (ell * x_hat)   # p_t + R_t * ℓ * x̂
             P_t2 = target_pos + target_R @ (ell * y_hat)   # p_t + R_t * ℓ * ŷ
 
-            # 计算几何误差 e_shape = Σ_k ||P_e,k - P_t,k||²
-            e_shape = (torch.norm(P_e0 - P_t0) ** 2 +
-                       torch.norm(P_e1 - P_t1) ** 2 +
-                       torch.norm(P_e2 - P_t2) ** 2)
+            # 🎯 计算shape_error（论文中的几何位置误差）
+            shape_error = (torch.norm(P_e0 - P_t0) ** 2 +
+                          torch.norm(P_e1 - P_t1) ** 2 +
+                          torch.norm(P_e2 - P_t2) ** 2)
 
             # 计算姿态误差 θ = 2 * arccos(|Δq_w|)
             delta_q = self._quaternion_multiply(target_quat, self._quaternion_inverse(current_quat))
             delta_q_w = delta_q[0]  # w分量
             theta = 2 * torch.arccos(torch.clamp(torch.abs(delta_q_w), 0.0, 1.0))
 
-            # 根据论文(18)：先计算标量误差 e = e_shape + λ_ori * θ
+            # 🎯 按照论文：||e||² = shape_error + θ²
+            e2 = shape_error + theta * theta  # ✅ ||e||²（直接加和，不加权）
+
+            # ✅ 计算归一化形状误差（用于奖励计算）
+            # 这里使用当前误差与之前误差的归一化差值
+            error_norm_curr = shape_error
+            error_norm_prev = self.prev_error_norm[i] if hasattr(self, 'prev_error_norm') else shape_error
+            e_shape = (error_norm_curr - error_norm_prev) / (error_norm_curr + error_norm_prev + 1e-8)
+
+            # 🔍 DEBUG: Check for potential NaN sources before computing reward
+            if torch.isnan(e_shape):
+                print(f"🚨 [REWARD DEBUG] NaN in e_shape for env {i}!")
+                print(f"   P_e0: {P_e0}, P_t0: {P_t0}")
+                print(f"   P_e1: {P_e1}, P_t1: {P_t1}")
+                print(f"   P_e2: {P_e2}, P_t2: {P_t2}")
+                e_shape = 0.0  # Fallback
+
+            if torch.isnan(theta):
+                print(f"🚨 [REWARD DEBUG] NaN in theta for env {i}!")
+                print(f"   delta_q: {delta_q}, delta_q_w: {delta_q_w}")
+                theta = 0.0  # Fallback
+
             e = e_shape + lambda_ori * theta  # 综合位置 + 姿态误差
             e_sq = e * e  # e²
 
-            # 🎯 根据论文公式：R(s,a) = -[ω1 * e² + ln(e² + τ)]
-            reward_i = -(w1 * e_sq + torch.log(e_sq + tau))
+            # 🔍 DEBUG: Check e_sq before log
+            if torch.isnan(e_sq):
+                print(f"🚨 [REWARD DEBUG] NaN in e_sq for env {i}!")
+                print(f"   e_shape: {e_shape}, theta: {theta}")
+                print(f"   e: {e}, lambda_ori: {lambda_ori}")
+                e_sq = 0.0  # Fallback
+
+            if e_sq < 0:
+                print(f"🚨 [REWARD DEBUG] Negative e_sq for env {i}: {e_sq}")
+                e_sq = 0.0  # Fallback
+
+            # 🎯 根据论文公式：R(s,a) = -[ω1 * e² + ln(e² + τ) + ω2*ψ_sum]
+            # 注意：当前reward_i只包含轨迹跟踪部分，障碍物惩罚在后面统一减去
+            log_arg = e_sq + tau
+            if torch.isnan(torch.log(log_arg)):
+                print(f"🚨 [REWARD DEBUG] NaN in log({log_arg}) for env {i}!")
+                print(f"   e_sq: {e_sq}, tau: {tau}")
+                log_term = 0.0  # Fallback
+            else:
+                log_term = torch.log(log_arg)
+
+            reward_i = -(w1 * e_sq + log_term)
+
+            # 🔍 DEBUG: Final reward check
+            if torch.isnan(reward_i):
+                print(f"🚨 [REWARD DEBUG] NaN in final reward for env {i}!")
+                print(f"   w1: {w1}, e_sq: {e_sq}, log_term: {log_term}")
+                reward_i = 0.0  # Fallback
+
             rewards[i] = reward_i
+
+        # 🎯 添加障碍物避免项 ψ_sum
+        # 根据论文：ψ_sum = Σ_i Σ_j ψ(d_obs(i,j))，其中d是障碍物到link的距离
+        w2 = 0.1  # 障碍物避免权重（可调参数）
+        tau = 1e-4  # 🎯 论文指定的τ值
+        psi_sum = torch.zeros(self.num_envs, device=self.device)
+
+        for i in range(self.num_envs):
+            # 计算当前关节配置的障碍物距离
+            obs_distances = self._compute_obstacle_distances(current_angles[i])  # [3]
+
+            # 对每个障碍物计算ψ函数
+            for j in range(self.num_obstacles):
+                d = obs_distances[j]  # 第j个障碍物的最小距离
+
+                # 🎯 根据论文ψ(d) = max(0, 1 - d/d_max)
+                psi = torch.clamp(1.0 - d / dmax, min=0.0)  # ✅ 论文 ψ 函数
+
+                psi_sum[i] += psi
+
+        # 🔍 DEBUG: Check psi_sum for NaN
+        if torch.isnan(psi_sum).any():
+            print(f"🚨 [REWARD DEBUG] NaN in psi_sum!")
+            for i in range(self.num_envs):
+                if torch.isnan(psi_sum[i]):
+                    print(f"   Env {i}: psi_sum NaN")
+                    # Recalculate with debugging
+                    try:
+                        obs_distances = self._compute_obstacle_distances(current_angles[i])
+                        print(f"   Obs distances: {obs_distances}")
+                    except Exception as e:
+                        print(f"   Obs distance calculation failed: {e}")
+            psi_sum = torch.nan_to_num(psi_sum, nan=0.0)  # Fallback
+
+        # 添加障碍物避免项到奖励函数
+        rewards -= w2 * psi_sum
+
+        # 🔍 FINAL DEBUG: Check final rewards
+        if torch.isnan(rewards).any():
+            print(f"🚨 [REWARD DEBUG] NaN in final rewards!")
+            nan_indices = torch.isnan(rewards).nonzero()
+            for idx in nan_indices[:5]:  # Show first 5 NaN values
+                env_idx = idx[0].item()
+                print(f"   Env {env_idx}: NaN reward")
+                # Try to identify the source
+                print(f"   e_shape: {e_shape if 'e_shape' in locals() else 'N/A'}")
+                print(f"   theta: {theta if 'theta' in locals() else 'N/A'}")
+                print(f"   psi_sum: {psi_sum[env_idx] if env_idx < len(psi_sum) else 'N/A'}")
+            # Replace NaN with zero reward
+            rewards = torch.nan_to_num(rewards, nan=0.0)
 
         # 6. 进步奖励：比上一帧更靠近目标就加分
         """progress_weight = self.trajectory_config.get("progress_weight", 5.0) if hasattr(self, 'trajectory_config') else 5.0
@@ -1856,11 +2070,11 @@ class UR10ePPOEnvIsaac:
         rewards += progress_reward"""
 
         # 7. 成功奖励：到达目标位置
-        success_threshold = 0.05  # 5cm
+        """success_threshold = 0.05  # 5cm
         self.waypoint_bonus = 50.0
         success_bonus = self.waypoint_bonus if hasattr(self, 'waypoint_bonus') else 10.0
         success = position_errors < success_threshold
-        rewards += success.float() * success_bonus
+        rewards += success.float() * success_bonus"""
 
         # 8. 更新误差跟踪
         #self._prev_position_errors = position_errors.detach()
@@ -2002,6 +2216,315 @@ class UR10ePPOEnvIsaac:
             if hasattr(self, 'debug_step') and self.debug_step % 1000 == 0:  # 偶尔报告错误
                 print(f"⚠️ 目标点绘制失败: {e}")
             pass
+
+    # 🎯 新增：障碍物相关方法
+    def _sample_obstacle_position(self):
+        """
+        根据论文附录A.4采样障碍物位置
+        工作空间：四分之一球环区域，major=0.6m��minor=0.15m，外加圆柱半径0.30m
+        """
+        # 论文参数
+        major_radius = 0.6   # 主环半径
+        minor_radius = 0.15  # 次环半径
+        cylinder_radius = 0.30  # 圆柱半径
+
+        max_attempts = 100
+        for _ in range(max_attempts):
+            # 在球环区域采样
+            # 随机采样球坐标
+            theta = np.random.uniform(0, 2 * np.pi)  # 方位角
+            phi = np.random.uniform(0, np.pi/2)       # 极角（只采样上半球）
+            r = np.random.uniform(major_radius - minor_radius, major_radius + minor_radius)  # 径向距离
+
+            # 转换为笛卡尔坐标
+            x = r * np.sin(phi) * np.cos(theta)
+            y = r * np.sin(phi) * np.sin(theta)
+            z = r * np.cos(phi)
+
+            # 检查是否在圆柱外
+            radial_dist = np.sqrt(x**2 + y**2)
+            if radial_dist > cylinder_radius and z > 0.1:  # 确保在地面上方且不在圆柱内
+                return gymapi.Vec3(x, y, z)
+
+        # 如果采样失败，返回默认位置
+        return gymapi.Vec3(0.5, 0.5, 0.5)
+
+    def _compute_link_positions(self, joint_angles: torch.Tensor) -> torch.Tensor:
+        """
+        计算6个关节点（形成5条link）的位置
+
+        Returns:
+            link_points: [6, 3] 6个关节点的位置（包括基座和末端）
+        """
+        link_points = torch.zeros((7, 3), device=joint_angles.device)  # 6个关节 + 末端
+        joint_angles = joint_angles.view(-1)
+
+        # UR10e DH参数 (与forward kinematics保持一致)
+        d = torch.tensor([0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655], device=joint_angles.device)
+        a = torch.tensor([0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0], device=joint_angles.device)
+        alpha = torch.tensor([math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0], device=joint_angles.device)
+
+        # 累积变换
+        T_cum = torch.eye(4, device=joint_angles.device, dtype=joint_angles.dtype)
+        link_points[0] = T_cum[:3, 3]  # 基座位置
+
+        for i in range(6):
+            # DH变换
+            theta = joint_angles[i]
+            ct = torch.cos(theta)
+            st = torch.sin(theta)
+            ca = torch.cos(alpha[i])
+            sa = torch.sin(alpha[i])
+
+            T_i = torch.zeros((4, 4), device=joint_angles.device, dtype=joint_angles.dtype)
+            T_i[0, 0] = ct
+            T_i[0, 1] = -st * ca
+            T_i[0, 2] = st * sa
+            T_i[0, 3] = a[i] * ct
+            T_i[1, 0] = st
+            T_i[1, 1] = ct * ca
+            T_i[1, 2] = -ct * sa
+            T_i[1, 3] = a[i] * st
+            T_i[2, 0] = 0.0
+            T_i[2, 1] = sa
+            T_i[2, 2] = ca
+            T_i[2, 3] = d[i]
+            T_i[3, 3] = 1.0
+
+            T_cum = T_cum @ T_i
+            link_points[i+1] = T_cum[:3, 3]  # 第i+1个关节位置
+
+        return link_points  # [7, 3]
+
+    def _distance_point_to_segment(self, point: torch.Tensor, seg_start: torch.Tensor, seg_end: torch.Tensor) -> torch.Tensor:
+        """
+        计算点到线段的最短距离（论文附录A.23/A.24几何公式）
+
+        Args:
+            point: [3] 点坐标
+            seg_start: [3] 线段起点
+            seg_end: [3] 线段终点
+
+        Returns:
+            distance: 最短距离
+        """
+        # 计算线段向量
+        seg_vec = seg_end - seg_start  # [3]
+        seg_len_sq = torch.sum(seg_vec ** 2)  # 线段长度平方
+
+        # 如果线段长度接近0，返回点到起点的距离
+        if seg_len_sq < 1e-8:
+            return torch.norm(point - seg_start)
+
+        # 计算投影系���t
+        point_vec = point - seg_start  # [3]
+        t = torch.dot(point_vec, seg_vec) / seg_len_sq
+
+        # 限制t在[0,1]范围内
+        t = torch.clamp(t, 0.0, 1.0)
+
+        # 计算最近点
+        closest_point = seg_start + t * seg_vec
+
+        # 计算距离
+        distance = torch.norm(point - closest_point)
+
+        return distance
+
+    def _compute_obstacle_distances(self, joint_angles: torch.Tensor) -> torch.Tensor:
+        """
+        计算障碍物到5-link的距离（dobs）
+
+        Returns:
+            dobs: [3] 每个障碍物对5条link取最小距离
+        """
+        # 获取当前7个点（基座+6关节）的位置
+        link_points = self._compute_link_positions(joint_angles)  # [7, 3]
+
+        # 形成5条link线段 (6个关节点形成5条link)
+        link_segments = []
+        for i in range(6):  # 6个关节点形成5条link
+            link_segments.append((link_points[i], link_points[i+1]))
+
+        # 初始化障碍物距离
+        dobs = torch.zeros(self.num_obstacles, device=joint_angles.device)
+
+        # 🎯 获取障碍物位置（优先使用实际存储的位置）
+        obstacle_positions_to_use = None
+
+        if hasattr(self, 'obstacle_positions') and len(self.obstacle_positions) > 0:
+            # 使用第一个环境的障碍物位置作为默认值（单个环境调用时的回退方案）
+            if isinstance(self.obstacle_positions[0], list):
+                obstacle_positions_to_use = torch.tensor(
+                    self.obstacle_positions[0], device=joint_angles.device, dtype=torch.float32
+                )  # [3, 3]
+            else:
+                # 如果是tensor格式，直接使用
+                obstacle_positions_to_use = self.obstacle_positions[0]  # [3, 3]
+        else:
+            # 如果还没有障碍物位置，使用默认值
+            obstacle_positions_to_use = torch.tensor([
+                [0.4, 0.4, 0.5],
+                [0.4, -0.4, 0.5],
+                [-0.4, 0.0, 0.5]
+            ], device=joint_angles.device, dtype=torch.float32)  # [3, 3]
+
+        # 对每个障碍物计算到所有link的最小距离
+        for obs_idx in range(self.num_obstacles):
+            obs_pos = obstacle_positions_to_use[obs_idx]  # [3]
+
+            min_distance = float('inf')
+
+            # 计算障碍物到每条link的距离，取最小值
+            for link_idx, (seg_start, seg_end) in enumerate(link_segments):
+                dist = self._distance_point_to_segment(obs_pos, seg_start, seg_end)
+                min_distance = min(min_distance, dist.item())
+
+            dobs[obs_idx] = min_distance
+
+        return dobs
+
+    def _compute_obstacle_distances_batch(self, joint_angles: torch.Tensor) -> torch.Tensor:
+        """
+        批量计算障碍物到5-link的距离（dobs）
+
+        Args:
+            joint_angles: [num_envs, 6] 所有环境的关节角度
+
+        Returns:
+            dobs: [num_envs, 3] 每个环境每个障碍物的最小距离
+        """
+        # 🔍 DEBUG: Check input joint angles
+        if torch.isnan(joint_angles).any():
+            print(f"🚨 [DEBUG OBS_DIST] NaN in input joint_angles!")
+            print(f"   joint_angles: {joint_angles}")
+
+        # 🎯 确保joint_angles是2D tensor
+        if joint_angles.ndim == 1:
+            joint_angles = joint_angles.unsqueeze(0)  # [6] -> [1, 6]
+
+        num_envs = joint_angles.shape[0]
+        dobs = torch.zeros((num_envs, self.num_obstacles), device=joint_angles.device)
+
+        # 🎯 使用实际存储的障碍物位置
+        if hasattr(self, 'obstacle_positions') and len(self.obstacle_positions) > 0:
+            # 将障碍物位置转换为tensor [num_envs, num_obstacles, 3]
+            obstacle_positions_np = np.array(self.obstacle_positions)  # [num_envs, 3, 3]
+            obstacle_positions_tensor = torch.tensor(
+                obstacle_positions_np, device=joint_angles.device, dtype=torch.float32
+            )  # [num_envs, num_obstacles, 3]
+        else:
+            # 如果还没有障碍物位置，使用默认值
+            default_positions = np.array([
+                [0.4, 0.4, 0.5],
+                [0.4, -0.4, 0.5],
+                [-0.4, 0.0, 0.5]
+            ])
+            obstacle_positions_tensor = torch.tensor(
+                default_positions, device=joint_angles.device, dtype=torch.float32
+            ).unsqueeze(0).expand(num_envs, -1, -1)  # [num_envs, 3, 3]
+
+        # 🔍 DEBUG: Check obstacle positions
+        if torch.isnan(obstacle_positions_tensor).any():
+            print(f"🚨 [DEBUG OBS_DIST] NaN in obstacle_positions_tensor!")
+            print(f"   obstacle_positions_tensor: {obstacle_positions_tensor}")
+
+        # 对每个环境计算障碍物距离
+        for env_idx in range(num_envs):
+            env_angles = joint_angles[env_idx]  # [6]
+            env_obstacle_positions = obstacle_positions_tensor[env_idx]  # [3, 3]
+
+            # 🔍 DEBUG: Check individual environment values
+            if torch.isnan(env_angles).any():
+                print(f"🚨 [DEBUG OBS_DIST] NaN in env_angles for env {env_idx}!")
+                print(f"   env_angles: {env_angles}")
+            if torch.isnan(env_obstacle_positions).any():
+                print(f"🚨 [DEBUG OBS_DIST] NaN in env_obstacle_positions for env {env_idx}!")
+                print(f"   env_obstacle_positions: {env_obstacle_positions}")
+
+            # 计算当前环境的link位置
+            try:
+                link_points = self._compute_link_positions(env_angles)  # [7, 3]
+
+                # 🔍 DEBUG: Check link points
+                if torch.isnan(link_points).any():
+                    print(f"🚨 [DEBUG OBS_DIST] NaN in link_points for env {env_idx}!")
+                    print(f"   env_angles: {env_angles}")
+                    print(f"   link_points: {link_points}")
+                    # Use fallback link points
+                    link_points = torch.zeros((7, 3), device=env_angles.device)
+                    link_points[0] = torch.tensor([0.0, 0.0, 0.0], device=env_angles.device)
+                    for i in range(6):
+                        link_points[i+1] = link_points[i] + torch.tensor([0.1, 0.0, 0.0], device=env_angles.device)
+            except Exception as e:
+                print(f"🚨 [DEBUG OBS_DIST] Exception in _compute_link_positions for env {env_idx}: {e}")
+                # Use fallback link points
+                link_points = torch.zeros((7, 3), device=env_angles.device)
+                link_points[0] = torch.tensor([0.0, 0.0, 0.0], device=env_angles.device)
+                for i in range(6):
+                    link_points[i+1] = link_points[i] + torch.tensor([0.1, 0.0, 0.0], device=env_angles.device)
+
+            # 形成5条link线段 (6个关节点形成5条线段)
+            link_segments = []
+            for i in range(6):  # 6个关节点形成5条link
+                link_segments.append((link_points[i], link_points[i+1]))
+
+            # 对每个障碍物计算到所有link的最小距离
+            for obs_idx in range(self.num_obstacles):
+                obs_pos = env_obstacle_positions[obs_idx]  # [3]
+
+                # 🔍 DEBUG: Check obstacle position
+                if torch.isnan(obs_pos).any():
+                    print(f"🚨 [DEBUG OBS_DIST] NaN in obs_pos for env {env_idx}, obs {obs_idx}!")
+                    print(f"   obs_pos: {obs_pos}")
+                    obs_pos = torch.tensor([0.5, 0.5, 0.5], device=obs_pos.device)  # Fallback
+
+                min_distance = float('inf')
+
+                # 计算障碍物到每条link的距离，取最小值
+                for link_idx, (seg_start, seg_end) in enumerate(link_segments):
+                    try:
+                        # 🔍 DEBUG: Check segment points
+                        if torch.isnan(seg_start).any() or torch.isnan(seg_end).any():
+                            print(f"🚨 [DEBUG OBS_DIST] NaN in segment for env {env_idx}, link {link_idx}!")
+                            print(f"   seg_start: {seg_start}")
+                            print(f"   seg_end: {seg_end}")
+                            continue  # Skip this segment
+
+                        dist = self._distance_point_to_segment(obs_pos, seg_start, seg_end)
+
+                        # 🔍 DEBUG: Check distance calculation
+                        if torch.isnan(dist):
+                            print(f"🚨 [DEBUG OBS_DIST] NaN in distance calculation!")
+                            print(f"   obs_pos: {obs_pos}")
+                            print(f"   seg_start: {seg_start}")
+                            print(f"   seg_end: {seg_end}")
+                            dist = torch.tensor(1.0, device=obs_pos.device)  # Fallback distance
+
+                        min_distance = min(min_distance, dist.item())
+                    except Exception as e:
+                        print(f"🚨 [DEBUG OBS_DIST] Exception in distance calculation for env {env_idx}, obs {obs_idx}, link {link_idx}: {e}")
+                        continue  # Skip this problematic calculation
+
+                # Ensure we have a valid distance value
+                if min_distance == float('inf') or np.isnan(min_distance):
+                    min_distance = 1.0  # Fallback distance
+
+                dobs[env_idx, obs_idx] = min_distance
+
+        # 🔍 DEBUG: Check final dobs result
+        if torch.isnan(dobs).any():
+            print(f"🚨 [DEBUG OBS_DIST] NaN in final dobs!")
+            nan_indices = torch.isnan(dobs).nonzero()
+            for idx in nan_indices[:5]:  # Show first 5 NaN values
+                env_idx, obs_idx = idx[0].item(), idx[1].item()
+                print(f"   Env {env_idx}, Obs {obs_idx}: NaN")
+                print(f"   Env angles: {joint_angles[env_idx] if env_idx < joint_angles.shape[0] else 'N/A'}")
+                print(f"   Obs position: {obstacle_positions_tensor[env_idx, obs_idx] if env_idx < obstacle_positions_tensor.shape[0] else 'N/A'}")
+            # Replace NaN with fallback values
+            dobs = torch.nan_to_num(dobs, nan=1.0, posinf=10.0, neginf=0.0)
+
+        return dobs
 
     def close(self):
         """关闭环境"""

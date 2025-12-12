@@ -21,86 +21,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal
 
-class ActorNetwork_(nn.Module):
-    """Actor网络 - PPO策略函数"""
-
-    def __init__(self, state_dim: int = 22, action_dim: int = 6, hidden_dim: int = 64):
-        super().__init__()
-
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-
-        # Updated for normalized velocity control
-        self.action_space_high = torch.tensor([1.0] * action_dim, dtype=torch.float32)
-        self.action_space_low = torch.tensor([-1.0] * action_dim, dtype=torch.float32)
-
-        self.register_buffer("action_limits_tensor", torch.tensor([1.0] * action_dim, dtype=torch.float32)) 
-
-        # 策略网络
-        self.policy_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, action_dim * 2)  # 均值和标准差
-        )
-
-        # 初始化权重
-        self._init_actor_weights()
-
-    def _init_actor_weights(self):
-        """标准的 Orthogonal 初始化 + 零偏置，不再给输出层加 1.05 偏置"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-                nn.init.constant_(m.bias, 0.0)
-
-
-    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        前向传播
-
-        Args:
-            state: [batch_size, state_dim] 状态张量
-
-        Returns:
-            mean: [batch_size, action_dim] 动作均值
-            std: [batch_size, action_dim] 动作标准差
-        """
-        #self.max_torques_tensor = torch.tensor(self.max_torques, device=self.device, dtype=torch.float32)
-
-        policy_output = self.policy_net(state)
-        mean, log_std = policy_output.chunk(2, dim=-1)
-
-        # 更严格的 log_std 限制���防止标准差过大
-        log_std = torch.clamp(log_std, -4.0, 1.0)  # std范围: e^(-4)≈0.018 到 e^(1)≈2.7
-        std = F.softplus(log_std)   # 使用 softplus 更平滑，防止 std 暴增 
-        return mean, std
-
-    def sample(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        采样动作
-
-        Args:
-            state: [batch_size, state_dim] 状态张量
-
-        Returns:
-            action: [batch_size, action_dim] 采样动作
-            log_prob: [batch_size] 对数概率
-        """
-        mean, std = self.forward(state)
-        dist = Normal(mean, std)
-
-        #action = dist.sample() 
-        raw = dist.rsample()  # 用 rsample 方便以后做 reparameterization
-        log_prob = dist.log_prob(raw).sum(dim=-1)
-
-        action = torch.tanh(raw)  # 将动作限制在[-1, 1]范围内
-        # For normalized velocity control, action is already in [-1, 1] range
-        # No need to scale to torque limits
-        # action = action * self.action_limits_tensor  # This would just be identity
-
-        return action, log_prob
 
 class ActorNetwork(nn.Module):
     """Actor网络 - 论文风格 3×256 tanh MLP，高斯策略 + tanh-squash + 动作集成"""
@@ -152,15 +72,29 @@ class ActorNetwork(nn.Module):
             mean: [batch_size, action_dim]
             std:  [batch_size, action_dim]
         """
+
         x = self.feature_net(state)              # [B, 256]
+
 
         mean = self.mean_head(x)                 # [B, act_dim]
         log_std = self.log_std_head(x)           # [B, act_dim]
 
+        # 1) 先把非有限值处理掉（不切整图）
+        mean = torch.where(torch.isfinite(mean), mean, torch.zeros_like(mean))
+        log_std = torch.where(torch.isfinite(log_std), log_std, torch.full_like(log_std, -2.0))
+
+        # 2) 限制 mean 幅度：避免 log_prob 里出现 inf/-inf（超重要）
+        #   用“软限制”比 hard clamp 更平滑，梯度更健康
+        mean = 5.0 * torch.tanh(mean / 5.0)   # raw-space mean ∈ [-5, 5]
+
         # 防止 std 崩：限制 log_std 范围
         log_std = torch.clamp(log_std, -4.0, 1.0)
         # 和你现在一致，用 softplus 把它变成正数
-        std = F.softplus(log_std)
+        #std = F.softplus(log_std)
+        std = torch.exp(log_std)              # 比 softplus 更直观
+        std = torch.clamp(std, 1e-3, 2.0)
+
+
 
         return mean, std
 
@@ -177,15 +111,18 @@ class ActorNetwork(nn.Module):
 
         # raw 空间的采样（rsample 方便以后重参数化）
         raw = dist.rsample()
-        log_prob = dist.log_prob(raw).sum(dim=-1)
 
         # tanh-squash 到 [-1, 1]
         action = torch.tanh(raw)
+        
+        # ✅ 用带tanh修正的log_prob（和训练更新一致）
+        log_prob = self.squashed_log_prob(dist, action)
 
         return action, log_prob
 
+
     def sample_with_ensemble(self, state: torch.Tensor, ensemble_size: int,
-                           use_delta_std: bool = True, delta_std: float = 0.1) -> torch.Tensor:
+                           use_delta_std: bool = True, delta_std: float = 0.1) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         动作集成（Action Ensembles, AE）采样
 
@@ -199,30 +136,113 @@ class ActorNetwork(nn.Module):
 
         Returns:
             ensemble_action: [batch_size, action_dim] 集成平均后的动作
+            ensemble_log_prob: [batch_size] 对应的log概率
         """
-        with torch.no_grad():  # 动作集成不需要梯度
-            mean, std = self.forward(state)
-            batch_size = state.shape[0]
+        mean, std = self.forward(state)
+        batch_size = state.shape[0]
 
-            # 使用论文建议的δ_θ（固定标准差）而非策略的标准差σ_θ
-            if use_delta_std:
-                std = torch.full_like(std, delta_std)
+        # 使用论文建议的δ_θ（固定标准差）而非策略的标准差σ_θ
+        if use_delta_std:
+            std = torch.full_like(std, delta_std)
 
-            # 扩展维度用于批量采样：[batch_size, ensemble_size, action_dim]
-            mean_expanded = mean.unsqueeze(1).expand(batch_size, ensemble_size, -1)
-            std_expanded = std.unsqueeze(1).expand(batch_size, ensemble_size, -1)
+        # 扩展维度用于批量采样：[batch_size, ensemble_size, action_dim]
+        mean_expanded = mean.unsqueeze(1).expand(batch_size, ensemble_size, -1)
+        std_expanded = std.unsqueeze(1).expand(batch_size, ensemble_size, -1)
 
-            # 创建分布并批量采样
-            dist = Normal(mean_expanded, std_expanded)
-            raw_samples = dist.sample()  # [batch_size, ensemble_size, action_dim]
+        # 创建分布并批量采样
+        dist = Normal(mean_expanded, std_expanded)
+        raw_samples = dist.sample()  # [batch_size, ensemble_size, action_dim]
 
-            # tanh-squash到[-1,1]
-            action_samples = torch.tanh(raw_samples)
+        # 🎯 论文版本：先平均原始动作，再应用tanh
+        # a_t = tanh(mean_j(N(μ_θ(s_t), δ_θ)))
+        ensemble_raw_action = raw_samples.mean(dim=1)  # [batch_size, action_dim]
+        ensemble_action = torch.tanh(ensemble_raw_action)  # tanh-squash到[-1,1]
 
-            # 集成平均：取ensemble维度上的平均
-            ensemble_action = action_samples.mean(dim=1)  # [batch_size, action_dim]
+        # 🎯 论文版本：计算平均后动作的log_prob
+        # 平均原始动作的分布：N(mean, std/√ensemble_size)
+        averaged_std = std / torch.sqrt(torch.tensor(ensemble_size, dtype=torch.float32, device=std.device))
+        averaged_dist = Normal(mean, averaged_std)
+        ensemble_log_prob = self.squashed_log_prob(averaged_dist, ensemble_action)
 
-            return ensemble_action
+        return ensemble_action, ensemble_log_prob
+
+    def compute_log_prob_with_ensemble(self, state: torch.Tensor, actions: torch.Tensor,
+                                      ensemble_size: int, use_delta_std: bool = True,
+                                      delta_std: float = 0.1) -> torch.Tensor:
+        """
+        🎯 统一的log_prob计算方法：确保rollout和update阶段使用完全相同的逻辑
+
+        这个方法专门用于update阶段，确保new_log_probs的计算与rollout阶段的old_log_probs
+        使用完全相同的分布定义和计算路径。
+
+        Args:
+            state: [batch_size, state_dim] 状态张量
+            actions: [batch_size, action_dim] 动作张量
+            ensemble_size: 集成采样次数
+            use_delta_std: 是否使用δ_θ而非σ_θ
+            delta_std: δ_θ固定标准差
+
+        Returns:
+            log_probs: [batch_size] 对应的log概率
+        """
+        mean, std = self.forward(state)
+
+        # 使用论文建议的δ_θ（固定标准差）而非策略的标准差σ_θ
+        if use_delta_std:
+            std = torch.full_like(std, delta_std)
+
+        # 🎯 关键：使用与sample_with_ensemble完全相同的分布定义
+        # 平均原始动作的分布：N(mean, std/√ensemble_size)
+        averaged_std = std / torch.sqrt(torch.tensor(ensemble_size, dtype=torch.float32, device=std.device))
+        averaged_dist = Normal(mean, averaged_std)
+
+        # 使用相同的squashed_log_prob方法
+        log_probs = self.squashed_log_prob(averaged_dist, actions)
+
+        return log_probs
+
+    def atanh(self, x: torch.Tensor) -> torch.Tensor:
+        """数值安全的atanh实现"""
+        x = torch.clamp(x, -0.999, 0.999)
+        return 0.5 * (torch.log1p(x) - torch.log1p(-x))
+
+    def squashed_log_prob(self, dist: torch.distributions.Normal, actions: torch.Tensor) -> torch.Tensor:
+        """
+        计算squashed Gaussian的log_prob
+
+        Args:
+            dist: torch.distributions.Normal, raw空间的高斯分布
+            actions: torch.Tensor, [-1,1]范围的squashed动作
+
+        Returns:
+            log_prob: torch.Tensor, 考虑tanh变换的log概率
+        """
+        # 将squashed动作还原到raw空间
+        raw = self.atanh(actions)
+        # 计算raw空间的log_prob
+        logp = dist.log_prob(raw).sum(dim=-1)
+        # 减去tanh变换的Jacobian对数行列式: log|det(∂tanh/∂raw)|
+        # ∂tanh/∂raw = 1 - tanh²(raw) = 1 - actions²
+        # 因为1 - actions² > 0（|actions| < 1），所以可以直接用log
+        jacobian_log = torch.log(1 - actions * actions + 1e-6).sum(dim=-1)
+        logp -= jacobian_log
+        return logp
+
+    def get_dist(self, states: torch.Tensor, fixed_std: float = None) -> torch.distributions.Normal:
+        """
+        获取策略分布，支持固定标准差
+
+        Args:
+            states: [batch_size, state_dim]
+            fixed_std: float, 如果提供则使用固定std，否则使用网络std
+
+        Returns:
+            dist: torch.distributions.Normal
+        """
+        mean, std = self.forward(states)
+        if fixed_std is not None:
+            std = torch.ones_like(std) * fixed_std
+        return torch.distributions.Normal(mean, std)
 
     def compute_aew_ensemble_size(self, current_episode: int, max_episodes: int,
                                 alpha: float = 5.0, beta: float = 8.0, lambda_max: float = None) -> int:
@@ -263,41 +283,6 @@ class ActorNetwork(nn.Module):
 
         return ensemble_size
 
-
-class CriticNetwork_(nn.Module):
-    """Critic网络 - PPO价值函数"""
-
-    def __init__(self, state_dim: int = 22, hidden_dim: int = 64):
-        super().__init__()
-
-        # 价值网络
-        self.value_net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-
-        # 初始化权重
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight.data, gain=np.sqrt(2))
-            nn.init.constant_(module.bias.data, 0)
-
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播
-
-        Args:
-            state: [batch_size, state_dim] 状态张量
-
-        Returns:
-            value: [batch_size, 1] 状态价值
-        """
-        return self.value_net(state)
 
 class CriticNetwork(nn.Module):
     """Critic网络 - 论文风格 3×256 tanh MLP"""
@@ -559,6 +544,13 @@ class PPOIsaac:
         episode_rewards = np.zeros(self.num_envs)
         episode_lengths = np.zeros(self.num_envs)
 
+        # 🎯 A) 修复：一个rollout只用一个固定的ensemble size
+        if self.ae_enabled:
+            self.update_ensemble_size()
+            rollout_ensemble_size = int(self.current_ensemble_size)
+        else:
+            rollout_ensemble_size = 1
+
         for step in range(self.rollout_length):
             # 确保states是2D张量 [num_envs, state_dim]
             if states.ndim == 1:
@@ -571,19 +563,14 @@ class PPOIsaac:
             with torch.no_grad():
                 # 🎯 使用动作集成（AE）采样（如果启用）
                 if self.ae_enabled:
-                    # 更新采样次数
-                    self.update_ensemble_size()
-
-                    # 使用AE采样动作（平均后的动作）
-                    actions = self.actor.sample_with_ensemble(
+                    # 使用AE采样动作（平均后的动作）并获取对应的log_prob
+                    # 🎯 关键：使用固定的rollout_ensemble_size，确保一致性
+                    actions, log_probs = self.actor.sample_with_ensemble(
                         states_for_sampling,
-                        ensemble_size=self.current_ensemble_size,
+                        ensemble_size=rollout_ensemble_size,
                         use_delta_std=True,
                         delta_std=self.ae_delta_std
                     )
-
-                    # 为训练计算标准采样的log_prob（用于策略更新）
-                    _, log_probs = self.actor.sample(states_for_sampling)
                 else:
                     # 标准PPO采样
                     actions, log_probs = self.actor.sample(states_for_sampling)
@@ -688,9 +675,12 @@ class PPOIsaac:
 
             states = next_states
 
+        # 🎯 添加ensemble size到rollouts中（用于update阶段一致性）
+        rollouts['ensemble_size'] = rollout_ensemble_size
+
         # 转换为张量
         for key in rollouts:
-            if key != 'next_states':
+            if key not in ['next_states', 'ensemble_size']:
                 rollouts[key] = torch.stack(rollouts[key], dim=0)  # [rollout_length, num_envs]
 
         return rollouts
@@ -754,13 +744,17 @@ class PPOIsaac:
 
         # 计算GAE优势和回报（支持策略反馈）
         if self.pf_enabled:
-            # 🎯 策略反馈：需要动作概率来计算自适应折扣因子
-            with torch.no_grad():
-                policy_dist = Normal(self.actor(states)[0], self.actor(states)[1])
-                action_probs = torch.exp(policy_dist.log_prob(actions).sum(dim=-1))
-                action_probs = action_probs.view(self.rollout_length, self.num_envs)
+            # ✅ 策略反馈关键修复：直接使用rollout时存��的log_probs计算action_probs
+            # old_log_probs已经在rollout阶段使用与AE/atanh对齐的完整计算流程
+            # old_log_probs: [T*N] -> [T, N]
+            old_lp = rollouts['log_probs'].view(self.rollout_length, self.num_envs)
 
-                advantages, returns = self.gae(rewards, dones, values, next_values_expanded, action_probs)
+            # ✅ PF核心：直接使用rollout存储的log_probs，避免重新计算导致的不对齐
+            # 论文定义: γ = clip(π(s,a), η, 1)，其中π(s,a)是rollout时的策略概率
+            # 连续动作密度可能>1，因此先用clamp确保π(s,a) <= 1
+            action_probs = torch.exp(torch.clamp(old_lp, max=0.0))
+
+            advantages, returns = self.gae(rewards, dones, values, next_values_expanded, action_probs)
         else:
             # 标准GAE
             advantages, returns = self.gae(rewards, dones, values, next_values_expanded)
@@ -794,36 +788,34 @@ class PPOIsaac:
                 batch_advantages = advantages[batch_indices]
                 batch_returns = returns[batch_indices]
 
-                # 计算新的动作概率 (需要梯度进行更新)
-                #new_means, new_stds = self.actor(batch_states)
-                #ist = Normal(new_means, new_stds)
-                #batch_new_log_probs = dist.log_prob(batch_actions).sum(dim=-1)
+                # 🎯 B) 修复：使用rollout中存储的ensemble size确保一致性
+                if self.ae_enabled:
+                    # 🎯 关键修复：使用rollout时存储的ensemble_size，确保old/new_log_probs使用相同分布
+                    ensemble_size = int(rollouts['ensemble_size'])  # 从rollout读取固定的ensemble size
+                    batch_new_log_probs = self.actor.compute_log_prob_with_ensemble(
+                        batch_states, batch_actions,
+                        ensemble_size=ensemble_size,  # 🎯 使用rollout时的固定值
+                        use_delta_std=True,
+                        delta_std=self.ae_delta_std
+                    )
+                    # AE模式：获取分布用于熵计算
+                    mean, std = self.actor(batch_states)
+                    if self.ae_delta_std is not None:
+                        std = torch.ones_like(std) * self.ae_delta_std
+                    dist = Normal(mean, std)
+                else:
+                    # 标准模式：使用标准采样方法
+                    new_means, new_stds = self.actor(batch_states)
+                    dist = Normal(new_means, new_stds)
+                    batch_new_log_probs = self.actor.squashed_log_prob(dist, batch_actions)
 
                 # 计算比率
                 #ratio = torch.exp(batch_new_log_probs - batch_old_log_probs)
-
-                # 1. 得到高斯参数（raw 空间）
-                new_means, new_stds = self.actor(batch_states)   # [B, act_dim]
-                dist = Normal(new_means, new_stds)
-
-                # 2. 把归一化速度动作还原回 raw 空间
-                #   2.1 速度已经是 [-1,1] 范围，直接使用
-                squashed = batch_actions  # [B,6]，已经是 [-1,1] 范���
-
-                #   2.2 数值安全一点，夹紧在 (-1+eps, 1-eps)
-                eps = 1e-6
-                squashed = torch.clamp(squashed, -1.0 + eps, 1.0 - eps)
-
-                #   2.3 反 tanh：raw = atanh(squashed)
-                raw = 0.5 * (torch.log1p(squashed) - torch.log1p(-squashed))
-                # 也可以用 torch.atanh(squashed)（如果你的 torch 版本支持）
-
-                # 3. 在 raw 空间下算 log_prob
-                batch_new_log_probs = dist.log_prob(raw).sum(dim=-1)
-
-                # 4. 一切照旧
-                ratio = torch.exp(batch_new_log_probs - batch_old_log_probs)
-
+                batch_old_log_probs = torch.nan_to_num(batch_old_log_probs, nan=0.0, posinf=0.0, neginf=0.0)
+                log_ratio = batch_new_log_probs - batch_old_log_probs
+                log_ratio = torch.nan_to_num(log_ratio, nan=0.0, posinf=20.0, neginf=-20.0)
+                log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
+                ratio = torch.exp(log_ratio)
 
                 # Actor损失 (PPO裁剪)
                 surr1 = ratio * batch_advantages
@@ -865,7 +857,7 @@ class PPOIsaac:
                 self.actor_optimizer.zero_grad()
 
                 try:
-                    actor_total_loss.backward(retain_graph=True)
+                    actor_total_loss.backward()
 
                     # 检查actor梯度
                     if hasattr(self, '_debug_mode') and self._debug_mode:
@@ -905,13 +897,21 @@ class PPOIsaac:
         # 计算平均值
         num_updates = self.num_updates * (states.shape[0] // self.batch_size)
 
+        # 获取用于显示的策略std
+        if self.ae_enabled:
+            # AE模式：使用固定δ_std
+            policy_std = self.ae_delta_std
+        else:
+            # 标准模式：使用最后一个批次的网络std
+            policy_std = new_stds.mean().item()
+
         metrics = {
             'actor_loss': total_actor_loss / num_updates,
             'critic_loss': total_critic_loss / num_updates,
             'entropy': total_entropy / num_updates,
             'mean_advantage': advantages.mean().item(),
             'mean_return': returns.mean().item(),
-            'policy_std': new_stds.mean().item()
+            'policy_std': policy_std
         }
 
         return metrics

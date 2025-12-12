@@ -1,9 +1,9 @@
 ae:
   alpha: 5.0
-  beta: 3.0
-  delta_std: 0.1
+  beta: 8.0
+  delta_std: 0.15
   enabled: true
-  lambda_max: 3
+  lambda_max: 21
 debug:
   log_level: INFO
   monitor_frequency: 10
@@ -12,7 +12,7 @@ device: cuda:0
 env:
   device_id: 0
   dt: 0.01
-  max_steps: 100
+  max_steps: 150
   num_envs: 1
   target_range:
     x:
@@ -42,18 +42,18 @@ joint_limits:
   - 6.283
   - 6.283
 pf:
-  enabled: false
+  enabled: true
   eta_max: 0.99
   eta_min: 0.6
 pid_params:
   base_gains:
     d:
-    - 50.0
-    - 50.0
-    - 30.0
-    - 20.0
-    - 10.0
-    - 5.0
+    - 80
+    - 80
+    - 55
+    - 35
+    - 28
+    - 14
     i:
     - 0.0
     - 0.0
@@ -62,11 +62,11 @@ pid_params:
     - 0.0
     - 0.0
     p:
-    - 1000.0
-    - 1000.0
+    - 3000.0
+    - 3000.0
+    - 1500.0
     - 800.0
-    - 400.0
-    - 200.0
+    - 600.0
     - 100.0
   torque_limits:
   - 330.0
