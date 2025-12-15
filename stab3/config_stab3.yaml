@@ -1,0 +1,172 @@
+# UR10e PPO Stable-Baselines3 Configuration
+# 适配 ppo_ur10e_gym 目录的配置文件
+
+# Environment settings - 环境配置
+env:
+  max_steps: 1000              # 每回合最大步数
+  dt: 0.01                    # 时间步长 (100Hz)
+  device_id: 0                # GPU设备ID
+  num_envs: 1                # 并行环境数量
+
+# Control configuration (纯RL控制)
+control:
+  max_increment_torque: 40.0  # 每步最大增量力矩 (N⋅m)
+  torque_safety_factor: 0.8   # 力矩安全系数 (官方限制的80%)
+  velocity_safety_factor: 0.8 # 速度安全系数
+  control_frequency: 100      # 控制频率 (Hz)
+
+  # 高级控制参数
+  torque_momentum_decay: 0.95     # 力矩动量衰减系数
+  velocity_penalty_strength: 10.0 # 速度惩罚强度
+
+# Safety configuration - 安全配置
+safety:
+  emergency_stop_threshold: 0.5  # 紧急停止触发阈值 (m)
+  collision_threshold: 0.1       # 碰撞检测阈值 (m)
+  joint_position_limits: on      # 启用关节位置限制
+  torque_limits: on             # 启用力矩限制
+
+# State normalization - 状态归一化
+state_normalization:
+  enabled: true                 # 启用状态归一化
+  target_position_range:        # 目标位置归一化范围
+    x: [-1.0, 1.0]             # X轴范围 (米)
+    y: [-1.0, 1.0]             # Y轴范围 (米)
+    z: [0.0, 1.5]              # Z轴范围 (米)
+  tcp_position_range:           # TCP位置归一化范围
+    x: [-1.2, 1.2]             # X轴范围 (米)
+    y: [-1.2, 1.2]             # Y轴范围 (米)
+    z: [0.0, 1.8]              # Z轴范围 (米)
+
+# Reward normalization - 奖励归一化
+reward_normalization:
+  enabled: true                 # 启用奖励归一化
+  gamma: 0.99                   # 折扣因子
+  clip_range: 5.0              # 归一化裁剪范围
+  normalize_method: 'running_stats'  # 归一化方法
+  warmup_steps: 100            # 预热步数
+
+# Reward function configuration - 奖励函数配置
+reward:
+  # 距离奖励 (线性惩罚)
+  distance_weight: 2.0          # 距离惩罚权重
+
+  # 成功奖励
+  success_reward: 10.0          # 到达目标的奖励
+  success_threshold: 0.05       # 成功距离阈值 (5cm)
+
+  # 进度奖励
+  progress_weight: 3.0          # 向目标前进的奖励权重
+
+  # 稳定性和效率
+  stability_weight: 0.3         # 力矩大小惩罚权重
+  energy_weight: 0.01          # 能量消耗权重
+
+  # 其他塑造
+  time_penalty: 0.01           # 每步时间惩罚，鼓励效率
+  joint_limit_penalty: 1.0     # 关节限位接近惩罚
+
+# Target configuration - 目标配置
+target:
+  range:
+    x: [-0.6, 0.6]             # X轴范围 (米)
+    y: [-0.6, 0.6]             # Y轴范围 (米)
+    z: [0.1, 0.8]              # Z轴范围 (米)
+  min_reachability: 0.1        # 最小可达性边界
+
+# Isaac Gym simulator configuration - Isaac Gym仿真配置
+simulator:
+  use_gpu: true                # 启用GPU加速
+  use_gpu_pipeline: false      # 禁用GPU管线以避免CUDA内存问题
+  graphics_device_id: -1        # 图形设备ID (-1为无头模式)
+
+  # PhysX参数
+  solver_type: 1               # 求解器类型 (1 = TGS)
+  num_position_iterations: 4   # 位置求解器迭代次数
+  num_velocity_iterations: 1   # 速度求解器迭代次数
+  substeps: 2                  # 仿真子步骤数
+
+  # 物理参数
+  gravity: -9.81               # 重力 (m/s²)
+
+# Graphics and visualization - 图形和可视化
+graphics:
+  graphics_device_id: 0        # 可视化图形设备ID
+
+visualization:
+  enable: false                # 训练时启用可视化
+  render_freq: 1               # 渲染频率
+
+# Stable-Baselines3 PPO Configuration - PPO配置
+ppo:
+  # Network architecture - 网络架构
+  policy: "MlpPolicy"          # 策略网络类型
+  policy_kwargs:
+    net_arch: [512, 256, 128]  # 隐藏层大小
+    activation_fn: "relu"      # 激活函数
+    ortho_init: true           # 使用正交初始化
+    log_std_init: -0.5         # 动作标准差初始值
+
+  # Learning parameters - 学习参数
+  learning_rate: 3.0e-4        # 学习率 (策略和价值网络)
+  n_steps: 2048                # 每次更新的步数
+  batch_size: 64               # 训练批次大小
+  n_epochs: 10                 # 每次更新的优化轮数
+  target_kl: 0.02              # 早停的KL散度目标
+
+  # PPO-specific parameters - PPO特定参数
+  gamma: 0.99                 # 折扣因子
+  gae_lambda: 0.95             # GAE λ参数
+  clip_range: 0.1              # PPO裁剪参数
+  clip_range_vf: null          # 价值函数的独立裁剪
+  normalize_advantage: true    # 归一化优势
+  ent_coef: 0.01               # 探索熵系数
+  vf_coef: 0.5                 # 价值函数系数
+  max_grad_norm: 0.5           # 梯度裁剪
+
+  # Training configuration - 训练配置
+  total_timesteps: 1000000     # 总训练步数
+  tensorboard_log: "./logs/"   # TensorBoard日志目录
+
+  # Evaluation - 评估
+  eval_freq: 10000             # 评估频率
+  n_eval_episodes: 10          # 每次评估的回合数
+
+# Device configuration - 设备配置
+device:
+  # PyTorch设备
+  pytorch_device: "cuda:0"
+
+  # Isaac Gym设备
+  isaac_gym_device_id: 0
+
+  # 环境变量一致性
+  cuda_visible_devices: "0"
+  pytorch_cuda_alloc_conf: "max_split_size_mb:128"
+
+# Training monitoring - 训练监控
+logging:
+  log_level: "INFO"
+  log_interval: 10             # 每N次更新记录一次日志
+  save_freq: 5000             # 每N步保存一次模型
+
+  # 性能跟踪
+  track_success_rate: true
+  track_reward_progress: true
+  track_torque_usage: true
+  track_distance_progress: true
+
+# Task-Space Configuration - 任务空间配置
+task_space:
+  workspace_bounds:
+    x: [-1.4, 1.4]    # X轴工作空间范围 (米)
+    y: [-1.4, 1.4]    # Y轴工作空间范围 (米)
+    z: [0.0, 1.0]     # Z轴工作空间范围 (米)
+
+# Debug and development - 调试和开发
+debug:
+  render_during_training: false  # 训练时启用渲染
+  save_simulation_states: false  # 保存仿真状态用于调试
+  verbose_logging: false         # 启用详细日志
+  test_mode: false               # 启用测试模式
+  validate_gradients: false      # 训练时验证梯度

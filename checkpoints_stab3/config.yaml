@@ -1,0 +1,137 @@
+control:
+  control_frequency: 100
+  max_increment_torque: 40.0
+  torque_momentum_decay: 0.95
+  torque_safety_factor: 0.8
+  velocity_penalty_strength: 10.0
+  velocity_safety_factor: 0.8
+debug:
+  render_during_training: false
+  save_simulation_states: false
+  test_mode: false
+  validate_gradients: false
+  verbose_logging: false
+device:
+  cuda_visible_devices: '0'
+  isaac_gym_device_id: 0
+  pytorch_cuda_alloc_conf: max_split_size_mb:128
+  pytorch_device: cuda:0
+env:
+  device_id: 0
+  dt: 0.01
+  max_steps: 1000
+  num_envs: 1
+graphics:
+  graphics_device_id: 0
+logging:
+  log_interval: 10
+  log_level: INFO
+  save_freq: 5000
+  track_distance_progress: true
+  track_reward_progress: true
+  track_success_rate: true
+  track_torque_usage: true
+ppo:
+  batch_size: 64
+  clip_range: 0.1
+  clip_range_vf: null
+  ent_coef: 0.01
+  eval_freq: 10000
+  gae_lambda: 0.95
+  gamma: 0.99
+  learning_rate: 0.0003
+  max_grad_norm: 0.5
+  n_epochs: 10
+  n_eval_episodes: 10
+  n_steps: 2048
+  normalize_advantage: true
+  policy: MlpPolicy
+  policy_kwargs:
+    activation_fn: relu
+    log_std_init: -0.5
+    net_arch:
+    - 512
+    - 256
+    - 128
+    ortho_init: true
+  target_kl: 0.02
+  tensorboard_log: ./logs/
+  total_timesteps: 1000000
+  vf_coef: 0.5
+reward:
+  distance_weight: 2.0
+  energy_weight: 0.01
+  joint_limit_penalty: 1.0
+  progress_weight: 3.0
+  stability_weight: 0.3
+  success_reward: 10.0
+  success_threshold: 0.05
+  time_penalty: 0.01
+reward_normalization:
+  clip_range: 5.0
+  enabled: true
+  gamma: 0.99
+  normalize_method: running_stats
+  warmup_steps: 100
+safety:
+  collision_threshold: 0.1
+  emergency_stop_threshold: 0.5
+  joint_position_limits: true
+  torque_limits: true
+simulator:
+  graphics_device_id: -1
+  gravity: -9.81
+  num_position_iterations: 4
+  num_velocity_iterations: 1
+  solver_type: 1
+  substeps: 2
+  use_gpu: true
+  use_gpu_pipeline: false
+state_normalization:
+  enabled: true
+  target_position_range:
+    x:
+    - -1.0
+    - 1.0
+    y:
+    - -1.0
+    - 1.0
+    z:
+    - 0.0
+    - 1.5
+  tcp_position_range:
+    x:
+    - -1.2
+    - 1.2
+    y:
+    - -1.2
+    - 1.2
+    z:
+    - 0.0
+    - 1.8
+target:
+  min_reachability: 0.1
+  range:
+    x:
+    - -0.6
+    - 0.6
+    y:
+    - -0.6
+    - 0.6
+    z:
+    - 0.1
+    - 0.8
+task_space:
+  workspace_bounds:
+    x:
+    - -1.4
+    - 1.4
+    y:
+    - -1.4
+    - 1.4
+    z:
+    - 0.0
+    - 1.0
+visualization:
+  enable: false
+  render_freq: 1

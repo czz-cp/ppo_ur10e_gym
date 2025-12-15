@@ -540,7 +540,7 @@ class PPOIsaac:
                 values = self.critic(states_for_sampling)
 
             # 调试信息 (每64步显示一次进度)
-            if step % 64 == 0 and hasattr(self.env, 'episode_steps'):
+            if step % 50 == 0 and hasattr(self.env, 'episode_steps'):
                 avg_episode_steps = self.env.episode_steps.mean().item()
                 max_episode_steps = self.env.episode_steps.max().item()
                 print(f"📈 Step {step:3d}: 平均episode步数: {avg_episode_steps:.1f}, 最大: {max_episode_steps}")
@@ -780,6 +780,19 @@ class PPOIsaac:
                     dist = Normal(mean, std)
                     batch_new_log_probs = dist.log_prob(batch_raw_means).sum(dim=-1)  # 🎯 对raw_means计算
 
+                # ✅ KL early-stop (PPO标准稳定器)
+                # 计算近似KL散度：KL(pi_new || pi_old) ≈ E[log pi_old - log pi_new]
+                with torch.no_grad():
+                    approx_kl = (batch_old_log_probs - batch_new_log_probs).mean().item()
+
+                    # 🛑 KL early-stop: 如果KL超过阈值，提前结束本轮update
+                if approx_kl > 0.05:  # 0.01~0.03都行，0.02是比较常用的值
+                    kl_early_stops += 1
+                    if kl_early_stops == 1:  # 只在第一次触发时打印
+                        print(f"⚠️ KL early-stop triggered: KL={approx_kl:.4f} > 0.02, stopping update epoch {update_epoch}")
+                    stop_update = True  # ✅ 设置标志，跳出两层循环
+                    break  # 跳出内层minibatch循环
+
                 # 计算比率
                 #ratio = torch.exp(batch_new_log_probs - batch_old_log_probs)
                 batch_old_log_probs = torch.nan_to_num(batch_old_log_probs, nan=0.0, posinf=0.0, neginf=0.0)
@@ -860,19 +873,7 @@ class PPOIsaac:
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.critic_optimizer.step()
 
-                # ✅ KL early-stop (PPO标准稳定器)
-                # 计算近似KL散度：KL(pi_new || pi_old) ≈ E[log pi_old - log pi_new]
-                with torch.no_grad():
-                    approx_kl = (batch_old_log_probs - batch_new_log_probs).mean().item()
-
-                # 🛑 KL early-stop: 如果KL超过阈值，提前结束本轮update
-                if approx_kl > 0.02:  # 0.01~0.03都行，0.02是比较常用的值
-                    kl_early_stops += 1
-                    if kl_early_stops == 1:  # 只在第一次触发时打印
-                        print(f"⚠️ KL early-stop triggered: KL={approx_kl:.4f} > 0.02, stopping update epoch {update_epoch}")
-                    stop_update = True  # ✅ 设置标志，跳出两层循环
-                    break  # 跳出内层minibatch循环
-
+    
                 # 累计统计
                 total_actor_loss += actor_loss.item()
                 total_critic_loss += critic_loss.item()
