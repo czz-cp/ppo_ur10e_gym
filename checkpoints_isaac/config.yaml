@@ -1,9 +1,9 @@
 ae:
   alpha: 5.0
   beta: 8.0
-  delta_std: 0.15
+  delta_std: 0.2
   enabled: true
-  lambda_max: 21
+  lambda_max: 15
 debug:
   log_level: INFO
   monitor_frequency: 10
@@ -76,8 +76,8 @@ pid_params:
   - 54.0
   - 54.0
 ppo:
-  clip_eps: 0.15
-  entropy_coef: 0.002
+  clip_eps: 0.1
+  entropy_coef: 0.001
   gamma: 0.995
   lam: 0.95
   lr_actor: 5e-4
@@ -129,7 +129,7 @@ train:
   log_interval: 10
   num_episodes: 10000
   num_updates: 10
-  rollout_length: 256
+  rollout_length: 150
   save_interval: 100
 trajectory_tracking:
   deviation_coef: 2.0

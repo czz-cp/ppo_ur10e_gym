@@ -44,12 +44,12 @@ ppo:
   lr_critic: 5e-4                # 降低Critic学习率
 
   # PPO核心参数（保守设置）
-  clip_eps: 0.15                 # 降低裁剪参数，更保守更新
+  clip_eps: 0.10                 # 降低裁剪参数，更保守更新
   gamma: 0.995                   # 略微提高折扣因子，更重视长期奖励
   lam: 0.95                      # GAE λ参数保持不变
 
   # 正则化（增加探索）
-  entropy_coef: 0.002             # 增加熵系数，鼓励更多探索
+  entropy_coef: 0.001             # 增加熵系数，鼓励更多探索
   value_coef: 0.5                # 价值函数系数保持不变
 
   # 梯度处理
@@ -57,7 +57,7 @@ ppo:
 
 # 训���配置（优化rollout策略）
 train:
-  rollout_length: 256           # 降低rollout长度，更适合500步episode
+  rollout_length: 150           # 降低rollout长度，更适合500步episode
   batch_size: 64                 # 批次大小
   num_updates: 10                # 每次收集后更新次数
   num_episodes: 10000            # 总训练回合数
@@ -178,8 +178,8 @@ ae:
   enabled: true                  # 启用动作集成
   alpha: 5.0                     # Weibull形状参数增长系数
   beta: 8.0                      # Weibull尺度参数增长系数
-  delta_std: 0.15                 # AE标准差（论文建议值）
-  lambda_max: 21
+  delta_std: 0.2                 # AE标准差（论文建议值）
+  lambda_max: 15
 
 
 # 🎯 策略反馈（Policy Feedback, PF）配置

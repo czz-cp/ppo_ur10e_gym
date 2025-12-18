@@ -1,2 +1,2 @@
-log_step,episode,actor_loss,critic_loss,entropy,mean_return
-0,0,0.003084,0.147655,-0.071727,1.958871
+log_step,iter,actor_loss,critic_loss,entropy,mean_return,episodes_finished,mean_episode_reward,mean_episode_length,success_rate,moving_avg_ep_reward_100,moving_success_rate_100
+0,0,0.544411,1.104223,-1.714495,2.127363,1,36.812225,150.00,0.0000,36.812225,0.0000

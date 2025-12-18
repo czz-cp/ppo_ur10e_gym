@@ -468,8 +468,256 @@ class PPOIsaac:
         except Exception as e:
             print(f"❌ 梯度计算测试失败: {e}")
             return False
-
+        
     def collect_rollouts(self) -> Dict[str, torch.Tensor]:
+        """
+        收集经验回放数据（加入：按done结算的episode级别统计）
+        Returns:
+            rollouts: 收集的数据字典
+        """
+        # ---- 懒初始化：避免你忘了在__init__里加窗口统计导致报错 ----
+        from collections import deque
+        if not hasattr(self, "ep_return_window"):
+            self.ep_return_window = deque(maxlen=100)
+            self.ep_len_window = deque(maxlen=100)
+            self.ep_success_window = deque(maxlen=100)
+        if not hasattr(self, "last_rollout_stats"):
+            self.last_rollout_stats = {}
+
+        # 重置环境
+        reset_result = self.env.reset()
+        if isinstance(reset_result, tuple):
+            states, info = reset_result
+            _ = info
+        else:
+            states = reset_result
+
+        # 确保状态在正确设备上
+        states = ensure_device(states, self.device)
+
+        # 初始化缓冲区
+        rollouts = {
+            'states': [],
+            'actions': [],
+            'log_probs': [],
+            'raw_means': [],   # 存储pre-clip的raw（AE下是raw_mean）
+            'values': [],
+            'rewards': [],
+            'dones': [],
+            'next_states': []
+        }
+
+        # ====== episode级别累计器：用torch在GPU上做（快，别用for逐env）======
+        ep_ret = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+        ep_len = torch.zeros(self.num_envs, device=self.device, dtype=torch.int32)
+        ep_succ = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)  # 0/1
+
+        finished_returns = []
+        finished_lengths = []
+        finished_success = []
+
+        # 🎯 一个rollout固定一个ensemble size
+        if self.ae_enabled:
+            self.update_ensemble_size()
+            rollout_ensemble_size = int(self.current_ensemble_size)
+        else:
+            rollout_ensemble_size = 1
+
+        def _extract_success_mask(infos):
+            """尽量鲁棒地从infos里提取success布尔mask（找不到就返回None）"""
+            if infos is None:
+                return None
+
+            # Gymnasium VecEnv常见：dict，某个key是[num_envs]数组
+            if isinstance(infos, dict):
+                for k in ["success", "is_success", "reached_goal", "goal_reached", "task_success"]:
+                    if k in infos:
+                        try:
+                            m = torch.as_tensor(infos[k], device=self.device).bool().flatten()
+                            return m
+                        except Exception:
+                            return None
+                return None
+
+            # 也可能是 list[dict]：每个env一个info
+            if isinstance(infos, (list, tuple)) and len(infos) == self.num_envs and len(infos) > 0 and isinstance(infos[0], dict):
+                tmp = []
+                for info_i in infos:
+                    v = bool(
+                        info_i.get("success", False) or
+                        info_i.get("is_success", False) or
+                        info_i.get("goal_reached", False) or
+                        info_i.get("reached_goal", False) or
+                        info_i.get("task_success", False)
+                    )
+                    tmp.append(v)
+                return torch.tensor(tmp, device=self.device, dtype=torch.bool)
+
+            return None
+
+        for step in range(self.rollout_length):
+            # 确保states是2D张量 [num_envs, state_dim]
+            if states.ndim == 1:
+                states = states.unsqueeze(0)
+
+            # 记录当前状态
+            rollouts['states'].append(states.clone())
+
+            # 采样动作（rollout收集用no_grad）
+            states_for_sampling = states.detach()
+            with torch.no_grad():
+                if self.ae_enabled:
+                    actions, log_probs, raw_means = self.actor.sample_with_ensemble_clip(
+                        states_for_sampling,
+                        ensemble_size=rollout_ensemble_size,
+                        delta_std=self.ae_delta_std
+                    )
+                else:
+                    actions, log_probs, raw_actions = self.actor.sample_clip(
+                        states_for_sampling,
+                        delta_std=self.ae_delta_std
+                    )
+                    raw_means = raw_actions
+
+                values = self.critic(states_for_sampling)  # [N,1]
+
+            # 执行动作
+            step_result = self.env.step(actions)
+            if len(step_result) == 5:
+                next_states, rewards, terminated, truncated, infos = step_result
+                dones = np.logical_or(terminated, truncated)
+            elif len(step_result) == 4:
+                next_states, rewards, dones, infos = step_result
+            else:
+                raise ValueError(f"环境step返回了{len(step_result)}个值，期望4或5个")
+
+            # ---- 统一搬到device + 统一形状 ----
+            next_states = ensure_device(next_states, self.device)
+            rewards = ensure_device(rewards, self.device)
+
+            # dones转torch.bool
+            if isinstance(dones, np.ndarray):
+                dones = torch.tensor(dones, dtype=torch.bool, device=self.device)
+            elif isinstance(dones, torch.Tensor):
+                dones = dones.to(self.device).bool()
+            else:
+                dones = torch.tensor([dones], dtype=torch.bool, device=self.device)
+
+            if dones.dim() == 0:
+                dones = dones.unsqueeze(0)
+            elif dones.dim() > 1:
+                dones = dones.flatten()
+
+            # rewards转torch.float32
+            if isinstance(rewards, (float, int, np.float32, np.float64, np.int32, np.int64)):
+                rewards = torch.tensor([rewards], dtype=torch.float32, device=self.device)
+            elif isinstance(rewards, np.ndarray):
+                rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+            elif isinstance(rewards, torch.Tensor):
+                rewards = rewards.to(self.device).float()
+            else:
+                rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+
+            if rewards.dim() == 0:
+                rewards = rewards.unsqueeze(0)
+            elif rewards.dim() > 1:
+                rewards = rewards.flatten()
+
+            # 设备一致性检查
+            assert_same_device(states, actions, next_states, rewards, dones, device=self.device)
+
+            # 记录数据
+            rollouts['actions'].append(actions.clone())
+            rollouts['log_probs'].append(log_probs.clone())
+            rollouts['raw_means'].append(raw_means.clone())
+            rollouts['values'].append(values.squeeze(-1).clone())
+            rollouts['rewards'].append(rewards.clone())
+            rollouts['dones'].append(dones.clone())
+            rollouts['next_states'].append(next_states.clone())
+
+            # ====== episode累计（向量化）======
+            ep_ret += rewards
+            ep_len += 1
+
+            succ_mask = _extract_success_mask(infos)
+            if succ_mask is not None:
+                ep_succ = torch.maximum(ep_succ, succ_mask.float())
+
+            done_ids = torch.where(dones)[0]
+            if done_ids.numel() > 0:
+                # 摘出已结束episode统计
+                done_ret = ep_ret[done_ids].detach().cpu().tolist()
+                done_len = ep_len[done_ids].detach().cpu().tolist()
+                done_suc = ep_succ[done_ids].detach().cpu().tolist()
+
+                finished_returns.extend(done_ret)
+                finished_lengths.extend(done_len)
+                finished_success.extend(done_suc)
+
+                # 更新全局计数
+                self.episode_count += int(done_ids.numel())
+                self.total_steps += int(ep_len[done_ids].sum().item())
+
+                # 更新最佳性能（用本批done里的最大回报）
+                max_r = float(ep_ret[done_ids].max().item())
+                if max_r > self.best_performance:
+                    self.best_performance = max_r
+                    print(f"🏆 新最佳性能! {self.best_performance:.4f}")
+
+                # 重置这些env的累计器
+                ep_ret[done_ids] = 0.0
+                ep_len[done_ids] = 0
+                ep_succ[done_ids] = 0.0
+
+            # 状态推进
+            states = next_states
+
+        # 存储本rollout固定的ensemble_size，供update阶段对齐
+        rollouts['ensemble_size'] = torch.tensor(rollout_ensemble_size, device=self.device)
+
+        # ====== 计算并缓存“本次rollout”的episode级指标 ======
+        if len(finished_returns) > 0:
+            mean_ep_r = float(np.mean(finished_returns))
+            mean_ep_len = float(np.mean(finished_lengths))
+        else:
+            mean_ep_r = float("nan")
+            mean_ep_len = float("nan")
+
+        if len(finished_success) > 0:
+            succ_rate = float(np.mean(finished_success))
+        else:
+            succ_rate = float("nan")
+
+        # 更新滑动窗口（最近100个episode）
+        for r in finished_returns:
+            self.ep_return_window.append(float(r))
+        for l in finished_lengths:
+            self.ep_len_window.append(int(l))
+        for s in finished_success:
+            self.ep_success_window.append(float(s))
+
+        mov_r = float(np.mean(self.ep_return_window)) if len(self.ep_return_window) > 0 else float("nan")
+        mov_s = float(np.mean(self.ep_success_window)) if len(self.ep_success_window) > 0 else float("nan")
+
+        self.last_rollout_stats = {
+            "episodes_finished": len(finished_returns),
+            "mean_episode_reward": mean_ep_r,
+            "mean_episode_length": mean_ep_len,
+            "success_rate": succ_rate,
+            "moving_avg_ep_reward_100": mov_r,
+            "moving_success_rate_100": mov_s,
+            "rollout_ensemble_size": int(rollout_ensemble_size),
+        }
+
+        # ====== stack成张量（与你原逻辑一致）======
+        for key in rollouts:
+            if key not in ['next_states', 'ensemble_size']:
+                rollouts[key] = torch.stack(rollouts[key], dim=0)
+
+        return rollouts
+
+
+    def collect_rollouts_(self) -> Dict[str, torch.Tensor]:
         """
         收集经验回放数据
 
@@ -782,7 +1030,7 @@ class PPOIsaac:
 
                 # ✅ KL early-stop (PPO标准稳定器)
                 # 计算近似KL散度：KL(pi_new || pi_old) ≈ E[log pi_old - log pi_new]
-                with torch.no_grad():
+                """with torch.no_grad():
                     approx_kl = (batch_old_log_probs - batch_new_log_probs).mean().item()
 
                     # 🛑 KL early-stop: 如果KL超过阈值，提前结束本轮update
@@ -791,7 +1039,7 @@ class PPOIsaac:
                     if kl_early_stops == 1:  # 只在第一次触发时打印
                         print(f"⚠️ KL early-stop triggered: KL={approx_kl:.4f} > 0.02, stopping update epoch {update_epoch}")
                     stop_update = True  # ✅ 设置标志，跳出两层循环
-                    break  # 跳出内层minibatch循环
+                    break  # 跳出内层minibatch循环"""
 
                 # 计算比率
                 #ratio = torch.exp(batch_new_log_probs - batch_old_log_probs)
@@ -941,7 +1189,10 @@ class PPOIsaac:
         # 🔹 初始化 loss 日志文件
         loss_log_path = os.path.join(save_dir, "loss_curve.csv")
         with open(loss_log_path, "w") as f:
-            f.write("log_step,episode,actor_loss,critic_loss,entropy,mean_return\n")
+            #f.write("log_step,episode,actor_loss,critic_loss,entropy,mean_return\n")
+            f.write("log_step,iter,actor_loss,critic_loss,entropy,mean_return,"
+            "episodes_finished,mean_episode_reward,mean_episode_length,success_rate,"
+            "moving_avg_ep_reward_100,moving_success_rate_100\n")
 
         # 训练统计
         training_stats = {
@@ -981,11 +1232,23 @@ class PPOIsaac:
                 
                  # 🔹 追加一行到 CSV（每 10 个 episode 记一次）
                 log_step = len(training_stats['actor_losses'])
+                stats = getattr(self, "last_rollout_stats", {})
                 with open(loss_log_path, "a") as f:
-                    f.write(
+                    """f.write(
                         f"{log_step},{episode},"
                         f"{metrics['actor_loss']:.6f},{metrics['critic_loss']:.6f},"
                         f"{metrics['entropy']:.6f},{metrics['mean_return']:.6f}\n"
+                    )"""
+                    f.write(
+                        f"{log_step},{episode},"
+                        f"{metrics['actor_loss']:.6f},{metrics['critic_loss']:.6f},"
+                        f"{metrics['entropy']:.6f},{metrics['mean_return']:.6f},"
+                        f"{stats.get('episodes_finished', 0)},"
+                        f"{stats.get('mean_episode_reward', float('nan')):.6f},"
+                        f"{stats.get('mean_episode_length', float('nan')):.2f},"
+                        f"{stats.get('success_rate', float('nan')):.4f},"
+                        f"{stats.get('moving_avg_ep_reward_100', float('nan')):.6f},"
+                        f"{stats.get('moving_success_rate_100', float('nan')):.4f}\n"
                     )
 
                 # 记录训练统计
